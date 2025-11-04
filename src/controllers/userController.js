@@ -1,11 +1,21 @@
-// controllers/userController.js (JSON version)
 import { asyncHandler } from "../utils/asyncHandler.js";
 import { ApiResponse } from "../utils/ApiResponse.js";
 import { ApiError } from "../utils/ApiError.js";
-import { uploadOnS3, uploadMultipleOnS3 } from "../utils/awsUtils.js";
+// Import the correct function name from s3Utils.js
+import { uploadToS3 } from "../utils/awsUtils.js"; // Assuming filename is awsUtils.js, adjust if it's s3Utils.js
 import { User } from "../models/userSchema.js";
+// Import the configured upload middleware (MUST use memoryStorage)
+import { upload } from '../middlewares/multer.js';
+import multer from 'multer';
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
+
+// === CHANGED: ensureAuthenticated now returns boolean instead of throwing ===
+const ensureAuthenticated = (req) => {
+	// Return true when req.user is populated, false otherwise
+	return !!(req && req.user && req.user._id);
+};
+// === end helper ===
 
 const generateAccessAndRefreshTokens = async (userId) => {
   try {
@@ -35,74 +45,185 @@ const generateAccessAndRefreshTokens = async (userId) => {
     );
   }
 };
-
 export const Register = asyncHandler(async (req, res) => {
-  const { 
-    email, 
-    password, 
-    username, 
-    confirmPassword, 
-    role,
-    sponsorId, // Optional sponsor ID for MLM
-    personalInfo,
-    bankDetails
-  } = req.body;
-
-  // Check for required fields first
-  if (!username || !email || !password || !confirmPassword) {
-    return res.status(400).json(new ApiResponse(400, null, "All fields are required"));
-  }
-
-  if (
-    [username, email, password, confirmPassword].some((field) => field?.trim() === "")
-  ) {
-    throw new ApiError(400, "All fields are required");
-  }
-
-  if (password !== confirmPassword) {
-    throw new ApiError(400, "Password and confirm password do not match");
-  }
-
-  const existedUser = await User.findOne({
-    $or: [{ username }, { email }],
-  });
-
-  if (existedUser) {
-    throw new ApiError(400, "User already exists");
-  }
-
-  // Validate sponsor if provided
-  let sponsor = null;
-  if (sponsorId) {
-    sponsor = await User.findById(sponsorId);
-    if (!sponsor) {
-      throw new ApiError(400, "Invalid sponsor ID");
+  // Use the configured 'upload' middleware for the 'profileImage' field
+  // This will parse the multipart/form-data and place the file in req.file
+  upload.single('profileImage')(req, res, async (err) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json(new ApiResponse(400, null, "File too large. Maximum size is 5MB."));
+      }
+      // Add handling for other Multer errors if needed
+      console.error("Multer Error:", err);
+      return res.status(400).json(new ApiResponse(400, null, `File upload error: ${err.message}`));
+    } else if (err) {
+      console.error("Multer Error:", err);
+      return res.status(400).json(new ApiResponse(400, null, `File upload error: ${err.message}`));
     }
-  }
 
-  const user = await User.create({
-    email: email.trim(),
-    password,
-    username: username.toLowerCase().trim(),
-    confirmPassword: confirmPassword.trim(),
-    role: role || "user",
-    sponsorId: sponsorId || null,
-    personalInfo: personalInfo || {},
-    bankDetails: bankDetails || {}
+    const {
+      email,
+      password,
+      username,
+      confirmPassword,
+      role,
+      sponsorId,
+      'personalInfo[firstName]': firstName,
+      'personalInfo[lastName]': lastName,
+      'personalInfo[phone]': phone,
+      'personalInfo[dateOfBirth]': dateOfBirth,
+      'personalInfo[address]': address,
+      'bankDetails[accountNumber]': accountNumber,
+      'bankDetails[ifscCode]': ifscCode,
+      'bankDetails[accountHolderName]': accountHolderName
+    } = req.body;
+
+    // Validation for non-file fields (same as before)
+    if (!username || !email || !password || !confirmPassword) {
+      return res.status(400).json(new ApiResponse(400, null, "All fields are required"));
+    }
+    if ([username, email, password, confirmPassword].some((field) => field?.trim() === "")) {
+      throw new ApiError(400, "All fields are required");
+    }
+    if (password !== confirmPassword) {
+      throw new ApiError(400, "Password and confirm password do not match");
+    }
+
+    const existedUser = await User.findOne({
+      $or: [{ username }, { email }],
+    });
+    if (existedUser) {
+      throw new ApiError(400, "User already exists");
+    }
+
+    // Validate sponsor and assign position logic (same as before)
+    let actualSponsor = null;
+    let assignedPosition = null;
+    let originalSponsorId = null;
+    if (sponsorId) {
+      const originalSponsor = await User.findOne({ referralCode: sponsorId });
+      if (!originalSponsor) {
+        throw new ApiError(400, "Invalid sponsor referral code");
+      }
+      originalSponsorId = originalSponsor._id;
+      const findAvailablePosition = async (rootUserId) => {
+        const queue = [rootUserId];
+        while (queue.length > 0) {
+          const currentUserId = queue.shift();
+          const children = await User.find({ sponsorId: currentUserId })
+            .select('_id position')
+            .lean();
+          const leftChild = children.find(child => child.position === 'left');
+          const rightChild = children.find(child => child.position === 'right');
+
+          if (!leftChild) {
+            return {
+              sponsorId: currentUserId,
+              position: 'left'
+            };
+          }
+          if (!rightChild) {
+            return {
+              sponsorId: currentUserId,
+              position: 'right'
+            };
+          }
+          queue.push(leftChild._id);
+          queue.push(rightChild._id);
+        }
+        throw new ApiError(500, "Unable to find available position in binary tree");
+      };
+      const placement = await findAvailablePosition(originalSponsor._id);
+      actualSponsor = await User.findById(placement.sponsorId);
+      assignedPosition = placement.position;
+      console.log(`Placing new user under sponsor: ${actualSponsor.username} (${actualSponsor.memberId}) at position: ${assignedPosition}`);
+
+      if (actualSponsor._id.toString() !== originalSponsor._id.toString()) {
+        console.log(`Spillover occurred: Original sponsor was ${originalSponsor.username}, placed under ${actualSponsor.username}`);
+      }
+    }
+
+    // --- Handle Profile Image Upload to S3 using the NEW utility (uploadToS3) with buffer ---
+    let profileImageUrl = null;
+    if (req.file) { // Check if a file was actually uploaded via Multer
+      try {
+        // Validate file type again if necessary (though multer filter should handle this)
+        const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+        if (!allowedTypes.includes(req.file.mimetype)) {
+          throw new ApiError(400, "Invalid file type. Only image files (jpeg, jpg, png, webp) are allowed.");
+        }
+
+        // Upload the file BUFFER to S3 using the NEW S3 utility (AWS SDK v3)
+        // Ensure multer is using memoryStorage so req.file.buffer exists
+        const uploadResult = await uploadToS3(
+          req.file.buffer,        // Pass the BUFFER (file content) here (requires memoryStorage)
+          req.file.originalname,  // Use the original filename for S3 key
+          req.file.mimetype,      // Pass the mime type
+          'profile-images'        // Specify the S3 folder
+        );
+        profileImageUrl = uploadResult.url; // Get the public URL from the result
+        console.log("Image uploaded to S3:", profileImageUrl);
+      } catch (uploadError) {
+        console.error("S3 Upload Error (Controller):", uploadError);
+        // Consider deleting the user if registration fails due to image upload
+        // await User.findByIdAndDelete(user._id); // Rollback user creation if needed
+        throw new ApiError(500, `Failed to upload profile image to storage: ${uploadError.message}`); // Include error details
+      }
+    }
+
+    // Prepare personalInfo and bankDetails objects (same as before)
+    const personalInfoObj = {
+      firstName: firstName?.trim() || '',
+      lastName: lastName?.trim() || '',
+      phone: phone?.trim() || '',
+      dateOfBirth: dateOfBirth ? new Date(dateOfBirth) : undefined,
+      address: address?.trim() || '',
+      profileImage: profileImageUrl // Store the S3 URL
+    };
+
+    const bankDetailsObj = {
+      accountNumber: accountNumber?.trim() || '',
+      ifscCode: ifscCode?.trim() || '',
+      accountHolderName: accountHolderName?.trim() || ''
+    };
+
+    const user = await User.create({
+      email: email.trim(),
+      password,
+      username: username.toLowerCase().trim(),
+      confirmPassword: confirmPassword.trim(),
+      role: role || "user",
+      sponsorId: actualSponsor ? actualSponsor._id : null,
+      position: actualSponsor ? assignedPosition : null,
+      personalInfo: personalInfoObj,
+      bankDetails: bankDetailsObj
+    });
+
+    const createdUser = await User.findOne({ _id: user._id }).select(
+      "-password -refreshToken -confirmPassword"
+    );
+
+    if (!createdUser) {
+      throw new ApiError(400, "User registration failed");
+    }
+
+    const responseData = {
+      ...createdUser.toObject(),
+      placementInfo: actualSponsor ? {
+        directSponsor: {
+          memberId: actualSponsor.memberId,
+          username: actualSponsor.username
+        },
+        position: assignedPosition,
+        isSpillover: originalSponsorId && actualSponsor._id.toString() !== originalSponsorId.toString()
+      } : null
+    };
+
+    return res.status(201).json(
+      new ApiResponse(201, responseData, "User registered successfully")
+    );
   });
-
-  const createdUser = await User.findOne({ _id: user._id }).select(
-    "-password -refreshToken -confirmPassword"
-  );
-  if (!createdUser) {
-    throw new ApiError(400, "User registration failed");
-  }
-
-  return res.status(201).json(
-    new ApiResponse(201, createdUser, "User registered successfully")
-  );
 });
-
 export const loginUser = asyncHandler(async (req, res) => {
   const { email, username, password } = req.body;
   
@@ -248,20 +369,108 @@ export const refreshAccessToken = asyncHandler(async (req, res) => {
 
 // Get current user profile
 export const getCurrentUser = asyncHandler(async (req, res) => {
+	// ...changed: guard that returns JSON instead of throwing...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+	return res
+		.status(200)
+		.json(new ApiResponse(200, req.user, "Current user fetched successfully"));
+});
+export const updateUserProfileWithImageUpload = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+	// Multer middleware should have already processed the file and placed it in req.file
+  // and text fields in req.body
+
+  const { 
+    firstName, 
+    lastName, 
+    phone, 
+    dateOfBirth, // Note: This might need date parsing if sent as string
+    address,
+    bio // Added bio as an example of an extra field
+  } = req.body;
+
+  let profileImageUrl = null;
+
+  // --- Handle Profile Image Upload to S3 using the utility ---
+  if (req.file) { // Check if a file was actually uploaded via Multer
+    try {
+      // Validate file type again if necessary (though multer filter should handle this)
+      const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+      if (!allowedTypes.includes(req.file.mimetype)) {
+        throw new ApiError(400, "Invalid file type. Only image files (jpeg, jpg, png, webp) are allowed.");
+      }
+
+      // Upload the file BUFFER to S3 using the S3 utility (AWS SDK v3)
+      // Ensure multer is using memoryStorage so req.file.buffer exists
+      const uploadResult = await uploadToS3(
+        req.file.buffer,        // Pass the BUFFER (file content) here (requires memoryStorage)
+        req.file.originalname,  // Use the original filename for S3 key
+        req.file.mimetype,      // Pass the mime type
+        'profile-images'        // Specify the S3 folder
+      );
+      profileImageUrl = uploadResult.url; // Get the public URL from the result
+      console.log("Profile image uploaded to S3:", profileImageUrl);
+    } catch (uploadError) {
+      console.error("S3 Upload Error (Controller):", uploadError);
+      throw new ApiError(500, `Failed to upload profile image to storage: ${uploadError.message}`); // Include error details
+    }
+  }
+
+  // Prepare the update object
+  const updateData = {};
+
+  // Add text fields to the update object if they exist in the request body
+  if (firstName !== undefined) updateData["personalInfo.firstName"] = firstName?.trim();
+  if (lastName !== undefined) updateData["personalInfo.lastName"] = lastName?.trim();
+  if (phone !== undefined) updateData["personalInfo.phone"] = phone?.trim();
+  if (address !== undefined) updateData["personalInfo.address"] = address?.trim();
+  if (bio !== undefined) updateData["personalInfo.bio"] = bio?.trim(); // Example for bio
+  if (dateOfBirth !== undefined) updateData["personalInfo.dateOfBirth"] = dateOfBirth ? new Date(dateOfBirth) : undefined; // Parse date if needed
+
+  // Add the new profile image URL if one was uploaded
+  if (profileImageUrl) {
+    updateData["personalInfo.profileImage"] = profileImageUrl;
+  }
+
+  // Find and update the user
+  const updatedUser = await User.findByIdAndUpdate(
+    req.user._id, // Assuming req.user is populated by authentication middleware
+    { $set: updateData },
+    { new: true, runValidators: true } // Return the updated document and run schema validators
+  ).select("-password -refreshToken -confirmPassword"); // Exclude sensitive fields
+
+  if (!updatedUser) {
+    // This shouldn't happen if authentication middleware is working correctly,
+    // but good to check
+    throw new ApiError(404, "User not found");
+  }
+
+  // Send success response
   return res
     .status(200)
-    .json(new ApiResponse(200, req.user, "Current user fetched successfully"));
+    .json(new ApiResponse(200, updatedUser, "Profile updated successfully"));
 });
-
 // Update user profile with single image (for JSON version, this would handle image URL if provided)
+// Update user profile with single image
 export const updateUserProfile = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const { 
     firstName, 
     lastName, 
     phone, 
     dateOfBirth, 
     address,
-    profileImage
+    profileImage  // This would be the image URL from S3
   } = req.body;
 
   const updateData = {
@@ -289,6 +498,11 @@ export const updateUserProfile = asyncHandler(async (req, res) => {
 
 // Update user profile with multiple images (for JSON version)
 export const updateUserProfileWithMultipleImages = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const { 
     firstName, 
     lastName, 
@@ -323,6 +537,11 @@ export const updateUserProfileWithMultipleImages = asyncHandler(async (req, res)
 
 // Update bank details
 export const updateBankDetails = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const { 
     accountNumber, 
     ifscCode, 
@@ -354,6 +573,11 @@ export const updateBankDetails = asyncHandler(async (req, res) => {
 
 // Update password
 export const changeCurrentPassword = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const { oldPassword, newPassword, confirmPassword } = req.body;
 
   if (newPassword !== confirmPassword) {
@@ -377,43 +601,189 @@ export const changeCurrentPassword = asyncHandler(async (req, res) => {
 
 // Get user's referral link
 export const getReferralLink = asyncHandler(async (req, res) => {
-  const user = await User.findById(req.user._id).select("referralLink");
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+  const user = await User.findById(req.user._id).select("referralLink referralCode");
   
   return res
     .status(200)
     .json(new ApiResponse(200, user, "Referral link fetched successfully"));
 });
 
-// Get user's downline (referrals)
+// Get user's downline (referrals) - BINARY SYSTEM VERSION with spillover support
 export const getMyReferrals = asyncHandler(async (req, res) => {
-  const { page = 1, limit = 10 } = req.query;
-  
-  const referrals = await User.find({ sponsorId: req.user.memberId })
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+  const { page = 1, limit = 10, includeIndirect = false } = req.query;
+
+  // Get direct referrals (children in binary tree)
+  const referrals = await User.find({ sponsorId: req.user._id })
     .select("-password -refreshToken -confirmPassword")
     .limit(parseInt(limit))
     .skip((parseInt(page) - 1) * parseInt(limit));
 
-  const totalReferrals = await User.countDocuments({ sponsorId: req.user.memberId });
+  const totalReferrals = await User.countDocuments({ sponsorId: req.user._id });
+
+  // Get complete binary tree structure with all levels
+  const getBinaryTree = async (currentUserId, maxDepth = 10, currentDepth = 0) => {
+    if (currentDepth >= maxDepth) return null;
+
+    const user = await User.findById(currentUserId)
+      .select("-password -refreshToken -confirmPassword");
+
+    if (!user) return null;
+
+    const children = await User.find({ sponsorId: currentUserId })
+      .select("-password -refreshToken -confirmPassword")
+      .sort({ position: 1 }); // Sort to ensure left comes first
+
+    const leftChild = children.find(child => child.position === 'left');
+    const rightChild = children.find(child => child.position === 'right');
+
+    return {
+      ...user.toObject(),
+      children: [
+        leftChild ? await getBinaryTree(leftChild._id, maxDepth, currentDepth + 1) : null,
+        rightChild ? await getBinaryTree(rightChild._id, maxDepth, currentDepth + 1) : null
+      ]
+    };
+  };
+
+  const binaryTree = await getBinaryTree(req.user._id);
+
+  // Calculate network statistics
+  const calculateNetworkStats = async (userId) => {
+    let totalNetwork = 0;
+    let leftLeg = 0;
+    let rightLeg = 0;
+
+    const countDownline = async (currentUserId, leg = null) => {
+      const children = await User.find({ sponsorId: currentUserId }).select('_id position');
+      
+      for (const child of children) {
+        totalNetwork++;
+        
+        if (leg === 'left') {
+          leftLeg++;
+        } else if (leg === 'right') {
+          rightLeg++;
+        }
+        
+        await countDownline(child._id, leg || child.position);
+      }
+    };
+
+    await countDownline(userId);
+    
+    return { totalNetwork, leftLeg, rightLeg };
+  };
+
+  const networkStats = await calculateNetworkStats(req.user._id);
 
   return res
     .status(200)
     .json(new ApiResponse(200, {
       referrals,
       totalReferrals,
+      binaryTree,
+      networkStats,
       page: parseInt(page),
       limit: parseInt(limit)
     }, "Referrals fetched successfully"));
 });
 
+// Get user's binary tree structure - Enhanced with spillover tracking
+export const getBinaryTree = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+  const { maxDepth = 10 } = req.query;
+
+  const buildBinaryTree = async (currentUserId, depth = 0) => {
+    if (depth >= parseInt(maxDepth)) return null;
+
+    const user = await User.findById(currentUserId)
+      .select("-password -refreshToken -confirmPassword");
+
+    if (!user) return null;
+
+    const children = await User.find({ sponsorId: currentUserId })
+      .select("-password -refreshToken -confirmPassword")
+      .sort({ position: 1 }); // Sort to ensure left comes first
+
+    const leftChild = children.find(child => child.position === 'left');
+    const rightChild = children.find(child => child.position === 'right');
+
+    return {
+      ...user.toObject(),
+      depth,
+      children: [
+        leftChild ? await buildBinaryTree(leftChild._id, depth + 1) : null,
+        rightChild ? await buildBinaryTree(rightChild._id, depth + 1) : null
+      ]
+    };
+  };
+
+  const binaryTree = await buildBinaryTree(req.user._id);
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, binaryTree, "Binary tree retrieved successfully"));
+});
+
 // Get user dashboard info
 export const getUserDashboard = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const user = await User.findById(req.user._id).select(
     "-password -refreshToken -confirmPassword"
   );
 
   // Calculate additional metrics
-  const totalReferrals = await User.countDocuments({ sponsorId: user.memberId });
-  const directReferrals = await User.countDocuments({ sponsorId: user.memberId });
+  const totalReferrals = await User.countDocuments({ sponsorId: user._id });
+  const directReferrals = await User.countDocuments({ sponsorId: user._id });
+
+  // Get binary tree depth
+  const getBinaryTreeDepth = async (currentUserId) => {
+    if (!currentUserId) return 0;
+    
+    const children = await User.find({ sponsorId: currentUserId });
+    if (children.length === 0) return 1;
+    
+    const depths = await Promise.all(
+      children.map(child => getBinaryTreeDepth(child._id))
+    );
+    return 1 + Math.max(...depths);
+  };
+
+  const treeDepth = await getBinaryTreeDepth(user._id);
+
+  // Calculate total network size
+  const calculateTotalNetwork = async (userId) => {
+    let total = 0;
+    const countDownline = async (currentUserId) => {
+      const children = await User.find({ sponsorId: currentUserId }).select('_id');
+      total += children.length;
+      for (const child of children) {
+        await countDownline(child._id);
+      }
+    };
+    await countDownline(userId);
+    return total;
+  };
+
+  const totalNetworkSize = await calculateTotalNetwork(user._id);
 
   return res
     .status(200)
@@ -421,12 +791,19 @@ export const getUserDashboard = asyncHandler(async (req, res) => {
       user,
       totalReferrals,
       directReferrals,
+      totalNetworkSize,
+      treeDepth,
       wallet: user.wallet
     }, "Dashboard data fetched successfully"));
 });
 
 // Upload KYC documents (for JSON version, this would accept image URLs)
 export const uploadKYCDocuments = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const { 
     aadharNumber, 
     panNumber, 
@@ -456,6 +833,11 @@ export const uploadKYCDocuments = asyncHandler(async (req, res) => {
 
 // Upload property images (for JSON version, this would accept image URLs)
 export const uploadPropertyImages = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const { propertyImages } = req.body;
   
   if (!propertyImages || !Array.isArray(propertyImages) || propertyImages.length === 0) {
@@ -479,6 +861,11 @@ export const uploadPropertyImages = asyncHandler(async (req, res) => {
 
 // Get user's property images
 export const getUserPropertyImages = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const user = await User.findById(req.user._id).select("personalInfo.propertyImages");
   
   return res
@@ -488,6 +875,11 @@ export const getUserPropertyImages = asyncHandler(async (req, res) => {
 
 // Delete specific property images
 export const deletePropertyImages = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const { imageUrls } = req.body; // Array of image URLs to delete
   
   if (!imageUrls || !Array.isArray(imageUrls) || imageUrls.length === 0) {
@@ -515,6 +907,11 @@ export const deletePropertyImages = asyncHandler(async (req, res) => {
 
 // Get user's rank information
 export const getUserRank = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   const user = await User.findById(req.user._id).select("rank wallet");
   
   return res
@@ -524,6 +921,11 @@ export const getUserRank = asyncHandler(async (req, res) => {
 
 // Delete user profile image
 export const deleteProfileImage = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
   await User.findByIdAndUpdate(
     req.user._id,
     { $unset: { "personalInfo.profileImage": "" } },
@@ -533,4 +935,325 @@ export const deleteProfileImage = asyncHandler(async (req, res) => {
   return res
     .status(200)
     .json(new ApiResponse(200, {}, "Profile image deleted successfully"));
+});
+
+export const getKYCStatus = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+  const user = await User.findById(req.user._id).select("kyc status");
+
+  if (!user) {
+    throw new ApiError(404, "User not found");
+  }
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, user.kyc, "KYC status fetched successfully"));
+});
+
+// Update user's KYC details (for users to update their own KYC)
+export const updateKYCDetails = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+  const { 
+    aadharNumber, 
+    panNumber, 
+    aadharDocument, 
+    panDocument, 
+    additionalDocuments 
+  } = req.body;
+
+  // Check if user is already verified
+  const user = await User.findById(req.user._id);
+  if (user.kyc.verified) {
+    throw new ApiError(400, "KYC already verified, cannot update");
+  }
+
+  const updateData = {
+    "kyc.aadharNumber": aadharNumber,
+    "kyc.panNumber": panNumber,
+    "kyc.verified": false, // Reset verification status on update
+    "kyc.rejectionReason": null // Clear any previous rejection reason
+  };
+
+  if (aadharDocument) {
+    updateData["kyc.aadharDocument"] = aadharDocument;
+  }
+  if (panDocument) {
+    updateData["kyc.panDocument"] = panDocument;
+  }
+  if (additionalDocuments && Array.isArray(additionalDocuments)) {
+    updateData["kyc.additionalDocuments"] = additionalDocuments;
+  }
+
+  const updatedUser = await User.findByIdAndUpdate(
+    req.user._id,
+    { $set: updateData },
+    { new: true }
+  ).select("-password -refreshToken -confirmPassword");
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, updatedUser, "KYC details updated successfully"));
+});
+
+// Admin: Verify user's KYC
+export const verifyKYC = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+	// existing admin role check remains
+	// ...existing code...
+});
+
+// Admin: Get pending KYC requests
+export const getPendingKYC = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+	// existing admin role check remains
+	// ...existing code...
+});
+
+// Admin: Reject user's KYC
+export const rejectKYC = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+	// existing admin role check remains
+	// ...existing code...
+});
+
+export const getCompanyTree = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+	const { maxDepth = 100 } = req.query; // Default to a high number to get full tree
+
+  // Find the root user (the one without a sponsorId - the original admin/user who started the tree)
+  const findRootUser = async () => {
+    // Assuming the root user is the one with no sponsorId and potentially an admin role
+    // You might need to adjust this logic based on how your root user is defined
+    const rootUser = await User.findOne({ sponsorId: null }).select("-password -refreshToken -confirmPassword");
+    return rootUser;
+  };
+
+  const buildBinaryTree = async (currentUserId, depth = 0) => {
+    if (depth >= parseInt(maxDepth)) return null;
+
+    const user = await User.findById(currentUserId)
+      .select("-password -refreshToken -confirmPassword");
+
+    if (!user) return null;
+
+    // Find direct children (left and right positions) under this user
+    const children = await User.find({ sponsorId: currentUserId })
+      .select("-password -refreshToken -confirmPassword")
+      .sort({ position: 1 }); // Sort to ensure left comes first
+
+    const leftChild = children.find(child => child.position === 'left');
+    const rightChild = children.find(child => child.position === 'right');
+
+    return {
+      ...user.toObject(),
+      depth,
+      children: [
+        leftChild ? await buildBinaryTree(leftChild._id, depth + 1) : null,
+        rightChild ? await buildBinaryTree(rightChild._id, depth + 1) : null
+      ]
+    };
+  };
+
+  const rootUser = await findRootUser();
+
+  if (!rootUser) {
+     // If no root user found with sponsorId: null, try finding the user with the oldest creation date or a specific admin user
+     // This is a fallback assuming the first user created is the root or an admin is the root
+     const potentialRoot = await User.findOne({ role: "admin" }).sort({ createdAt: 1 }).select("-password -refreshToken -confirmPassword");
+     if (!potentialRoot) {
+       throw new ApiError(404, "No root user found for the company tree.");
+     }
+     const companyTree = await buildBinaryTree(potentialRoot._id);
+     return res.status(200).json(new ApiResponse(200, companyTree, "Company tree retrieved successfully"));
+  }
+
+  const companyTree = await buildBinaryTree(rootUser._id);
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, companyTree, "Company tree retrieved successfully"));
+});
+
+// Get user's left genealogy (all users in the left leg)
+export const getLeftGenealogy = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+  const { maxDepth = 100 } = req.query; // Default depth limit
+
+  const buildLeftSubtree = async (currentUserId, depth = 0) => {
+    if (depth >= parseInt(maxDepth)) return null;
+
+    const user = await User.findById(currentUserId)
+      .select("-password -refreshToken -confirmPassword");
+
+    if (!user) return null;
+
+    // Find only the left child under this user
+    const leftChild = await User.findOne({ 
+      sponsorId: currentUserId, 
+      position: 'left' 
+    }).select("-password -refreshToken -confirmPassword");
+
+    if (!leftChild) return { ...user.toObject(), children: [] };
+
+    return {
+      ...user.toObject(),
+      depth,
+      children: [await buildLeftSubtree(leftChild._id, depth + 1)]
+    };
+  };
+
+  // Find the left child of the current user first
+  const leftChild = await User.findOne({ 
+    sponsorId: req.user._id, 
+    position: 'left' 
+  }).select("-password -refreshToken -confirmPassword");
+
+  if (!leftChild) {
+    return res
+      .status(200)
+      .json(new ApiResponse(200, [], "No left leg found"));
+  }
+
+  const leftGenealogy = await buildLeftSubtree(leftChild._id);
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, leftGenealogy, "Left genealogy retrieved successfully"));
+});
+
+// Get user's right genealogy (all users in the right leg)
+export const getRightGenealogy = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+  const { maxDepth = 100 } = req.query; // Default depth limit
+
+  const buildRightSubtree = async (currentUserId, depth = 0) => {
+    if (depth >= parseInt(maxDepth)) return null;
+
+    const user = await User.findById(currentUserId)
+      .select("-password -refreshToken -confirmPassword");
+
+    if (!user) return null;
+
+    // Find only the right child under this user
+    const rightChild = await User.findOne({ 
+      sponsorId: currentUserId, 
+      position: 'right' 
+    }).select("-password -refreshToken -confirmPassword");
+
+    if (!rightChild) return { ...user.toObject(), children: [] };
+
+    return {
+      ...user.toObject(),
+      depth,
+      children: [await buildRightSubtree(rightChild._id, depth + 1)]
+    };
+  };
+
+  // Find the right child of the current user first
+  const rightChild = await User.findOne({ 
+    sponsorId: req.user._id, 
+    position: 'right' 
+  }).select("-password -refreshToken -confirmPassword");
+
+  if (!rightChild) {
+    return res
+      .status(200)
+      .json(new ApiResponse(200, [], "No right leg found"));
+  }
+
+  const rightGenealogy = await buildRightSubtree(rightChild._id);
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, rightGenealogy, "Right genealogy retrieved successfully"));
+});
+
+// Get both left and right genealogy combined
+export const getFullGenealogy = asyncHandler(async (req, res) => {
+	// ...changed guard...
+	if (!ensureAuthenticated(req)) {
+		return res.status(401).json(new ApiResponse(401, null, "User not authenticated"));
+	}
+
+  const { maxDepth = 100 } = req.query; // Default depth limit
+
+  const buildSubtree = async (currentUserId, depth = 0) => {
+    if (depth >= parseInt(maxDepth)) return null;
+
+    const user = await User.findById(currentUserId)
+      .select("-password -refreshToken -confirmPassword");
+
+    if (!user) return null;
+
+    const children = await User.find({ sponsorId: currentUserId })
+      .select("-password -refreshToken -confirmPassword")
+      .sort({ position: 1 });
+
+    const leftChild = children.find(child => child.position === 'left');
+    const rightChild = children.find(child => child.position === 'right');
+
+    return {
+      ...user.toObject(),
+      depth,
+      children: [
+        leftChild ? await buildSubtree(leftChild._id, depth + 1) : null,
+        rightChild ? await buildSubtree(rightChild._id, depth + 1) : null
+      ]
+    };
+  };
+
+  const user = await User.findById(req.user._id)
+    .select("-password -refreshToken -confirmPassword");
+
+  if (!user) {
+    throw new ApiError(404, "User not found");
+  }
+
+  const children = await User.find({ sponsorId: req.user._id })
+    .select("-password -refreshToken -confirmPassword")
+    .sort({ position: 1 });
+
+  const leftChild = children.find(child => child.position === 'left');
+  const rightChild = children.find(child => child.position === 'right');
+
+  const genealogy = {
+    ...user.toObject(),
+    children: [
+      leftChild ? await buildSubtree(leftChild._id, 1) : null,
+      rightChild ? await buildSubtree(rightChild._id, 1) : null
+    ]
+  };
+
+  return res
+    .status(200)
+    .json(new ApiResponse(200, genealogy, "Full genealogy retrieved successfully"));
 });

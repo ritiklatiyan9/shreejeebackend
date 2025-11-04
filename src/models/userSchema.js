@@ -1,3 +1,4 @@
+// userSchema.js
 import mongoose, { Schema } from "mongoose";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -37,9 +38,10 @@ const UserSchema = new Schema(
       index: true
     },
     
-    // Referral System
+    // Referral System - Updated for proper binary tree support
     sponsorId: {
-      type: String, // MemberId of sponsor
+      type: Schema.Types.ObjectId, // Changed from String to ObjectId for proper referencing
+      ref: "User",
       default: null,
       index: true
     },
@@ -50,6 +52,11 @@ const UserSchema = new Schema(
     },
     referralLink: {
       type: String
+    },
+    position: { // For binary system (left or right)
+      type: String,
+      enum: ['left', 'right', null],
+      default: null
     },
 
     // Personal Information
@@ -69,11 +76,14 @@ const UserSchema = new Schema(
       dateOfBirth: {
         type: Date
       },
-      address: String, // Changed to String as per previous discussion
+      address: String,
       profileImage: {
-        type: String, // Cloudinary URL
+        type: String,
         default: null
-      }
+      },
+      propertyImages: [{
+        type: String
+      }]
     },
 
     // KYC Documents
@@ -83,7 +93,7 @@ const UserSchema = new Schema(
         sparse: true
       },
       aadharDocument: {
-        type: String // Cloudinary URL
+        type: String
       },
       panNumber: {
         type: String,
@@ -91,8 +101,11 @@ const UserSchema = new Schema(
         sparse: true
       },
       panDocument: {
-        type: String // Cloudinary URL
+        type: String
       },
+      additionalDocuments: [{
+        type: String
+      }],
       verified: {
         type: Boolean,
         default: false
@@ -282,14 +295,13 @@ UserSchema.pre("save", async function (next) {
   next();
 });
 
-// Helper function for referral code
+// Helper function for referral code (8 characters, alphanumeric)
 function generateReferralCode() {
   return Math.random().toString(36).substring(2, 10).toUpperCase();
 }
 
-// Helper function for member ID
+// Helper function for member ID (unique identifier)
 function generateMemberId() {
-  // Example: Generate a unique member ID (e.g., using timestamp and random)
   return `MEM${Date.now().toString(36).toUpperCase()}${Math.random().toString(36).substring(2, 6).toUpperCase()}`;
 }
 
@@ -303,7 +315,8 @@ UserSchema.methods.generateAccessToken = function () {
     { 
       _id: this._id, 
       email: this.email,
-      role: this.role 
+      role: this.role,
+      memberId: this.memberId
     },
     process.env.ACCESS_TOKEN_SECRET,
     { expiresIn: process.env.ACCESS_TOKEN_EXPIRY || "15m" }
@@ -322,5 +335,6 @@ UserSchema.methods.generateRefreshToken = function () {
 UserSchema.index({ email: 1, memberId: 1 });
 UserSchema.index({ sponsorId: 1, status: 1 });
 UserSchema.index({ referralCode: 1 });
+UserSchema.index({ sponsorId: 1, position: 1 }); // Critical for binary tree operations
 
 export const User = mongoose.model("User", UserSchema);
