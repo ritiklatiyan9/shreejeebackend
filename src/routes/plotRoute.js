@@ -11,7 +11,8 @@ import {
   rejectPlotBooking,
   getPendingBookings,
   getAllBookings,
-  getTeamBookingsStats
+  getTeamBookingsStats,
+  
 } from "../controllers/adminPlotController.js";
 
 import {
@@ -91,5 +92,8 @@ router.route("/user/plots/:plotId/cancel")
 
 router.route("/user/plots/payment")
   .post(verifyJWT, makePlotPayment);
+
+  router.route("/admin/plots/:plotId/approve")
+  .post(verifyJWT, isAdminLogin, approvePlotBooking);
 
 export default router;

@@ -3,65 +3,6 @@ import { asyncHandler } from "../utils/asyncHandler.js";
 import { Plot } from "../models/plotBooking.js";
 import { User } from "../models/userSchema.js";
 
-/* -------------------------------------------------------------------------- */
-/* ✅ ADMIN: APPROVE PLOT BOOKING (Full Payment Applied)                      */
-/* -------------------------------------------------------------------------- */
-const approvePlotBooking = asyncHandler(async (req, res) => {
-  const { plotId } = req.params;
-
-  const plot = await Plot.findById(plotId);
-  if (!plot) throw new ApiError(404, "Plot not found");
-  if (plot.status !== "pending")
-    throw new ApiError(400, "Plot booking is not in pending state");
-
-  // ✅ Approve the booking
-  plot.status = "booked";
-  plot.bookingDetails.status = "approved";
-  plot.bookingDetails.approvedBy = req.user._id;
-  plot.bookingDetails.approvedAt = new Date();
-
-  // 💰 Set payment to full price
-  if (plot.pricing?.totalPrice) {
-    plot.bookingDetails.totalPaidAmount = plot.pricing.totalPrice;
-    plot.bookingDetails.tokenAmount = plot.pricing.totalPrice;
-  }
-
-  await plot.save();
-
-  return res.status(200).json({
-    success: true,
-    message: "Plot booking approved successfully and full payment marked.",
-    data: plot,
-  });
-});
-
-/* -------------------------------------------------------------------------- */
-/* ❌ ADMIN: REJECT PLOT BOOKING (Reset to Available)                         */
-/* -------------------------------------------------------------------------- */
-const rejectPlotBooking = asyncHandler(async (req, res) => {
-  const { plotId } = req.params;
-
-  const plot = await Plot.findById(plotId);
-  if (!plot) throw new ApiError(404, "Plot not found");
-  if (plot.status !== "pending")
-    throw new ApiError(400, "Plot booking is not in pending state");
-
-  // ❌ Reset plot to available
-  plot.status = "available";
-  plot.bookingDetails.status = "rejected";
-  plot.bookingDetails.rejectedBy = req.user._id;
-  plot.bookingDetails.rejectedAt = new Date();
-  plot.bookingDetails.totalPaidAmount = 0;
-  plot.bookingDetails.tokenAmount = 0;
-
-  await plot.save();
-
-  return res.status(200).json({
-    success: true,
-    message: "Plot booking rejected and reset to available",
-    data: plot,
-  });
-});
 
 /* -------------------------------------------------------------------------- */
 /* ⏳ ADMIN: GET ALL PENDING BOOKINGS                                         */
@@ -416,6 +357,138 @@ const getPlotById = asyncHandler(async (req, res) => {
   });
 });
 
+const approvePlotBooking = asyncHandler(async (req, res) => {
+  const { plotId } = req.params;
+  const plot = await Plot.findById(plotId);
+  if (!plot) throw new ApiError(404, "Plot not found");
+  if (plot.status !== "pending")
+    throw new ApiError(400, "Plot booking is not in pending state");
+
+  const {
+    // New payment details from admin form
+    paymentDetails = [], // Array of objects for each installment
+    totalPaidAmount = 0,
+    // Optionally, you can also let admin set the final status
+    finalStatus = "booked"
+  } = req.body;
+
+  // ✅ Approve the booking
+  plot.status = finalStatus; // Can be 'booked' or 'sold' etc.
+  plot.bookingDetails.status = "approved";
+  plot.bookingDetails.approvedBy = req.user._id;
+  plot.bookingDetails.approvedAt = new Date();
+
+  // 💰 Update payment details if provided
+  if (Array.isArray(paymentDetails) && paymentDetails.length > 0) {
+    plot.bookingDetails.paymentSchedule = paymentDetails.map(detail => ({
+      installmentNumber: detail.installmentNumber || 1,
+      amount: detail.amount || 0,
+      dueDate: detail.dueDate ? new Date(detail.dueDate) : undefined,
+      paidDate: detail.paidDate ? new Date(detail.paidDate) : new Date(),
+      status: "paid",
+      receiptNo: detail.receiptNo || "",
+      paymentMode: detail.paymentMode || "cash",
+      transactionId: detail.transactionId || "",
+      transactionDate: detail.transactionDate ? new Date(detail.transactionDate) : new Date(),
+      notes: detail.notes || ""
+    }));
+  } else {
+    // If no payment details are provided, mark as fully paid with default values.
+    plot.bookingDetails.paymentSchedule = [{
+      installmentNumber: 1,
+      amount: plot.pricing?.totalPrice || 0,
+      dueDate: new Date(),
+      paidDate: new Date(),
+      status: "paid",
+      receiptNo: "AUTO_APPROVED",
+      paymentMode: "cash",
+      transactionId: "N/A",
+      transactionDate: new Date(),
+      notes: "Approved without specific payment details."
+    }];
+  }
+
+  // Set the total paid amount
+  plot.bookingDetails.totalPaidAmount = totalPaidAmount || plot.pricing?.totalPrice || 0;
+
+  await plot.save();
+
+  return res.status(200).json({
+    success: true,
+    message: "Plot booking approved successfully with payment details.",
+    data: plot,
+  });
+});
+
+
+/* -------------------------------------------------------------------------- */
+/* 🛠️ ADMIN: UPDATE EXISTING PAYMENT DETAILS                                 */
+/* -------------------------------------------------------------------------- */
+const updatePaymentDetails = asyncHandler(async (req, res) => {
+  const { plotId } = req.params;
+  const { installmentNumber, paymentDetails } = req.body;
+
+  const plot = await Plot.findById(plotId);
+  if (!plot) throw new ApiError(404, "Plot not found");
+
+  if (!plot.bookingDetails || !Array.isArray(plot.bookingDetails.paymentSchedule)) {
+    throw new ApiError(400, "No payment schedule found for this plot.");
+  }
+
+  const installmentIndex = plot.bookingDetails.paymentSchedule.findIndex(
+    (installment) => installment.installmentNumber === installmentNumber
+  );
+
+  if (installmentIndex === -1) {
+    throw new ApiError(400, `Installment ${installmentNumber} not found.`);
+  }
+
+  // Update the specific installment
+  plot.bookingDetails.paymentSchedule[installmentIndex] = {
+    ...plot.bookingDetails.paymentSchedule[installmentIndex],
+    ...paymentDetails,
+    paidDate: paymentDetails.paidDate ? new Date(paymentDetails.paidDate) : new Date(),
+    transactionDate: paymentDetails.transactionDate ? new Date(paymentDetails.transactionDate) : new Date(),
+    status: "paid" // Ensure status is updated to paid
+  };
+
+  // Recalculate totalPaidAmount
+  plot.bookingDetails.totalPaidAmount = plot.bookingDetails.paymentSchedule
+    .filter(installment => installment.status === "paid")
+    .reduce((sum, installment) => sum + installment.amount, 0);
+
+  await plot.save();
+
+  return res.status(200).json({
+    success: true,
+    message: `Payment details for installment ${installmentNumber} updated successfully.`,
+    data: plot,
+  });
+});
+const rejectPlotBooking = asyncHandler(async (req, res) => {
+  const { plotId } = req.params;
+  const plot = await Plot.findById(plotId);
+  if (!plot) throw new ApiError(404, "Plot not found");
+  if (plot.status !== "pending")
+    throw new ApiError(400, "Plot booking is not in pending state");
+
+  // ❌ Reset plot to available
+  plot.status = "available";
+  plot.bookingDetails.status = "rejected";
+  plot.bookingDetails.rejectedBy = req.user._id;
+  plot.bookingDetails.rejectedAt = new Date();
+  plot.bookingDetails.totalPaidAmount = 0;
+  plot.bookingDetails.tokenAmount = 0;
+  plot.bookingDetails.paymentSchedule = []; // Clear any payment schedule on rejection
+  await plot.save();
+
+  return res.status(200).json({
+    success: true,
+    message: "Plot booking rejected and reset to available",
+    data: plot,
+  });
+});
+
 export {
   createPlot,
   bulkCreatePlots,
@@ -427,5 +500,6 @@ export {
   rejectPlotBooking,
   getPendingBookings,
   getAllBookings,
-  getTeamBookingsStats
+  getTeamBookingsStats,
+  updatePaymentDetails,
 };
