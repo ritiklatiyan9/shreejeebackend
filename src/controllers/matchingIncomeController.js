@@ -1,762 +1,1039 @@
-// controllers/matchingIncomeController.js - COMPLETE FIXED VERSION
+// controllers/matchingIncomeController.js - Complete Implementation
+import { MatchingIncomeRecord } from '../models/matchingIncomeSchema.js';
 import { User } from '../models/userSchema.js';
 import { Plot } from '../models/plotBooking.js';
-import { MatchingIncomeRecord } from '../models/matchingIncomeSchema.js';
 import mongoose from 'mongoose';
 
-// ==================== HELPER FUNCTIONS ====================
+/* ============================================================================ */
+/* 🔷 USER CONTROLLERS                                                         */
+/* ============================================================================ */
 
-// Helper: Get all downline members recursively
-const getAllDownlineMembers = async (userId, position = null) => {
-  const members = [];
-  const visited = new Set();
-  
-  const traverse = async (currentUserId, targetPosition) => {
-    if (visited.has(currentUserId.toString())) return;
-    visited.add(currentUserId.toString());
-    
-    let query = { sponsorId: currentUserId };
-    if (targetPosition) {
-      query.position = targetPosition;
-    }
-    
-    const children = await User.find(query).select('_id username position').lean();
-    
-    for (const child of children) {
-      members.push(child);
-      await traverse(child._id, null); // Get all descendants
-    }
-  };
-  
-  await traverse(userId, position);
-  return members;
-};
-
-// ==================== MAIN CALCULATION FUNCTION ====================
-
-// Calculate matching income for current cycle (Manual/Cron - Deprecated, use auto-calculation)
-const calculateMatchingIncomeForCycle = async (req, res) => {
-  try {
-    const now = new Date();
-    const cycleStartDate = new Date(now.getFullYear(), now.getMonth(), 1);
-    const cycleEndDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-    cycleEndDate.setHours(23, 59, 59, 999);
-
-    console.log(`\n🔄 Calculating Matching Income for cycle: ${cycleStartDate.toISOString()} to ${cycleEndDate.toISOString()}`);
-
-    // Check if cycle already calculated
-    if (!req.skipDuplicateCheck) {
-      const existingRecords = await MatchingIncomeRecord.countDocuments({
-        cycleStartDate: { $gte: cycleStartDate },
-        cycleEndDate: { $lte: cycleEndDate }
-      });
-
-      if (existingRecords > 0) {
-        console.log(`⚠️ Cycle already calculated! Found ${existingRecords} existing records.`);
-        return res.status(400).json({
-          success: false,
-          message: `Matching income for this cycle has already been calculated. Found ${existingRecords} existing records.`,
-          existingRecords,
-          cycle: { 
-            start: cycleStartDate.toISOString(), 
-            end: cycleEndDate.toISOString() 
-          },
-          hint: 'Use the recalculate endpoint if you need to refresh the data.'
-        });
-      }
-    }
-
-    // Find all approved bookings
-    const bookings = await Plot.find({
-      'bookingDetails.bookingDate': { 
-        $gte: cycleStartDate, 
-        $lte: cycleEndDate 
-      },
-      'bookingDetails.status': 'approved'
-    })
-    .populate('bookingDetails.buyerId', '_id sponsorId position username personalInfo')
-    .select('_id plotNumber bookingDetails.buyerId bookingDetails.bookingDate pricing.totalPrice')
-    .lean();
-
-    if (bookings.length === 0) {
-      return res.status(200).json({ 
-        success: true,
-        message: 'No approved bookings found for this cycle.', 
-        recordsProcessed: 0 
-      });
-    }
-
-    console.log(`📊 Found ${bookings.length} approved bookings in this cycle`);
-
-    // Get all potential sponsors
-    const potentialSponsors = await User.find({ 
-      _id: { 
-        $in: await User.distinct('sponsorId', { sponsorId: { $ne: null } }) 
-      }
-    }).select('_id username sponsorId role').lean();
-
-    console.log(`👥 Found ${potentialSponsors.length} potential sponsors with downlines`);
-
-    const sponsorLegSalesMap = new Map();
-
-    // Build sponsor leg sales map
-    for (const sponsor of potentialSponsors) {
-      const isRootUser = !sponsor.sponsorId;
-      const isAdmin = sponsor.role === 'admin';
-      
-      if (isRootUser && !isAdmin) {
-        console.log(`⚠️ Sponsor ${sponsor.username} has no personal sponsor and is not admin, skipping`);
-        continue;
-      }
-      
-      if (isRootUser && isAdmin) {
-        console.log(`👑 Processing ROOT/ADMIN user: ${sponsor.username}`);
-      }
-
-      const sponsorId = sponsor._id.toString();
-      const leftLegMembers = await getAllDownlineMembers(sponsor._id, 'left');
-      const rightLegMembers = await getAllDownlineMembers(sponsor._id, 'right');
-      
-      console.log(`\n📍 Sponsor: ${sponsor.username} (${sponsorId})`);
-      console.log(`   Left Leg: ${leftLegMembers.length} members`);
-      console.log(`   Right Leg: ${rightLegMembers.length} members`);
-
-      const leftMemberIds = leftLegMembers.map(m => m._id.toString());
-      const rightMemberIds = rightLegMembers.map(m => m._id.toString());
-
-      sponsorLegSalesMap.set(sponsorId, { 
-        username: sponsor.username,
-        leftLeg: {
-          totalSales: 0,
-          totalBookings: 0,
-          directMembers: new Map(),
-          bookingDetails: []
-        },
-        rightLeg: {
-          totalSales: 0,
-          totalBookings: 0,
-          directMembers: new Map(),
-          bookingDetails: []
-        }
-      });
-
-      const sponsorData = sponsorLegSalesMap.get(sponsorId);
-
-      // Assign bookings to legs
-      for (const plot of bookings) {
-        const buyer = plot.bookingDetails.buyerId;
-        if (!buyer) continue;
-
-        const buyerId = buyer._id.toString();
-        const saleAmount = plot.pricing.totalPrice || 0;
-        const buyerName = buyer.username || 
-          `${buyer.personalInfo?.firstName || ''} ${buyer.personalInfo?.lastName || ''}`.trim() || 
-          'Unknown';
-
-        const bookingDetail = {
-          plotId: plot._id,
-          buyerId: buyer._id,
-          buyerName: buyerName,
-          amount: saleAmount,
-          bookingDate: plot.bookingDetails.bookingDate
-        };
-
-        if (leftMemberIds.includes(buyerId)) {
-          sponsorData.leftLeg.totalSales += saleAmount;
-          sponsorData.leftLeg.totalBookings += 1;
-          sponsorData.leftLeg.bookingDetails.push(bookingDetail);
-          
-          if (!sponsorData.leftLeg.directMembers.has(buyerId)) {
-            sponsorData.leftLeg.directMembers.set(buyerId, {
-              memberId: buyer._id,
-              memberName: buyerName,
-              sales: 0
-            });
-          }
-          sponsorData.leftLeg.directMembers.get(buyerId).sales += saleAmount;
-        } else if (rightMemberIds.includes(buyerId)) {
-          sponsorData.rightLeg.totalSales += saleAmount;
-          sponsorData.rightLeg.totalBookings += 1;
-          sponsorData.rightLeg.bookingDetails.push(bookingDetail);
-          
-          if (!sponsorData.rightLeg.directMembers.has(buyerId)) {
-            sponsorData.rightLeg.directMembers.set(buyerId, {
-              memberId: buyer._id,
-              memberName: buyerName,
-              sales: 0
-            });
-          }
-          sponsorData.rightLeg.directMembers.get(buyerId).sales += saleAmount;
-        }
-      }
-
-      console.log(`   Left Sales: ₹${sponsorData.leftLeg.totalSales.toFixed(2)}`);
-      console.log(`   Right Sales: ₹${sponsorData.rightLeg.totalSales.toFixed(2)}`);
-    }
-
-    // Calculate matching income
-    const recordsToInsert = [];
-
-    for (const [sponsorId, sponsorData] of sponsorLegSalesMap.entries()) {
-      const leftSales = sponsorData.leftLeg.totalSales;
-      const rightSales = sponsorData.rightLeg.totalSales;
-      const balancedAmount = Math.min(leftSales, rightSales);
-
-      console.log(`\n💰 Sponsor: ${sponsorData.username}`);
-      console.log(`   Balanced: ₹${balancedAmount.toFixed(2)}`);
-
-      if (balancedAmount > 0) {
-        const incomeAmount = (balancedAmount * 5) / 100;
-        const weakerLeg = leftSales < rightSales ? 'left' : rightSales < leftSales ? 'right' : 'equal';
-        const carryForward = {
-          left: leftSales - balancedAmount,
-          right: rightSales - balancedAmount
-        };
-
-        const newRecord = new MatchingIncomeRecord({
-          userId: new mongoose.Types.ObjectId(sponsorId),
-          cycleStartDate,
-          cycleEndDate,
-          incomeType: 'matching_bonus',
-          leftLeg: {
-            totalSales: leftSales,
-            totalBookings: sponsorData.leftLeg.totalBookings,
-            directMembers: Array.from(sponsorData.leftLeg.directMembers.values()),
-            bookingDetails: sponsorData.leftLeg.bookingDetails
-          },
-          rightLeg: {
-            totalSales: rightSales,
-            totalBookings: sponsorData.rightLeg.totalBookings,
-            directMembers: Array.from(sponsorData.rightLeg.directMembers.values()),
-            bookingDetails: sponsorData.rightLeg.bookingDetails
-          },
-          balancedAmount,
-          weakerLeg,
-          commissionPercentage: 5.0,
-          incomeAmount,
-          carryForward,
-          status: 'calculated',
-          notes: `Left: ${sponsorData.leftLeg.totalBookings} sales, Right: ${sponsorData.rightLeg.totalBookings} sales`
-        });
-
-        recordsToInsert.push(newRecord);
-        console.log(`   ✅ Income: ₹${incomeAmount.toFixed(2)}`);
-      }
-    }
-
-    // Insert records
-    if (recordsToInsert.length > 0) {
-      await MatchingIncomeRecord.insertMany(recordsToInsert);
-      const totalIncome = recordsToInsert.reduce((sum, r) => sum + r.incomeAmount, 0);
-      
-      console.log(`\n✅ Successfully inserted ${recordsToInsert.length} matching income records`);
-      
-      return res.status(200).json({
-        success: true,
-        message: `Successfully calculated and stored ${recordsToInsert.length} matching income records.`,
-        cycle: { 
-          start: cycleStartDate.toISOString(), 
-          end: cycleEndDate.toISOString() 
-        },
-        recordsCreated: recordsToInsert.length,
-        totalIncomeGenerated: totalIncome
-      });
-    }
-
-    return res.status(200).json({
-      success: true,
-      message: 'No matching income records generated for this cycle.',
-      recordsCreated: 0
-    });
-
-  } catch (error) {
-    console.error("❌ Error calculating matching income:", error);
-    return res.status(500).json({ 
-      success: false,
-      message: "Internal server error during matching income calculation.", 
-      error: error.message 
-    });
-  }
-};
-
-// ==================== USER INCOME QUERIES ====================
-
-// Get individual matching income for a user
-const getUserMatchingIncome = async (req, res) => {
+/**
+ * Get individual matching income records for a user
+ * GET /api/matching-income/user/:userId
+ */
+export const getUserMatchingIncome = async (req, res) => {
   try {
     const { userId } = req.params;
-    const { cycleStartDate, cycleEndDate, status, incomeType, page = 1, limit = 10 } = req.query;
+    const {
+      incomeType,
+      status,
+      legType,
+      startDate,
+      endDate,
+      page = 1,
+      limit = 20,
+      sortBy = 'saleDate',
+      sortOrder = 'desc'
+    } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ 
-        success: false,
-        message: 'Invalid User ID format.' 
-      });
-    }
+    // Build query
+    const query = { userId };
 
-    // Build filter
-    const filter = { userId: userId };
-
-    if (cycleStartDate) {
-      const start = new Date(cycleStartDate);
-      start.setHours(0, 0, 0, 0);
-      filter.cycleStartDate = { $gte: start };
-    }
-    
-    if (cycleEndDate) {
-      const end = new Date(cycleEndDate);
-      end.setHours(23, 59, 59, 999);
-      filter.cycleEndDate = { ...filter.cycleEndDate, $lte: end };
-    }
-    
-    if (status) {
-      filter.status = status;
-    }
-
-    if (incomeType) {
-      filter.incomeType = incomeType;
+    if (incomeType) query.incomeType = incomeType;
+    if (status) query.status = status;
+    if (legType) query.legType = legType;
+    if (startDate || endDate) {
+      query.saleDate = {};
+      if (startDate) query.saleDate.$gte = new Date(startDate);
+      if (endDate) query.saleDate.$lte = new Date(endDate);
     }
 
     // Pagination
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const skip = (page - 1) * limit;
+    const sortOptions = { [sortBy]: sortOrder === 'asc' ? 1 : -1 };
 
-    const [records, totalRecords] = await Promise.all([
-      MatchingIncomeRecord.find(filter)
-        .sort({ cycleEndDate: -1, incomeType: 1 })
-        .skip(skip)
-        .limit(parseInt(limit))
-        .populate('userId', 'username email memberId personalInfo')
-        .populate('approvedBy', 'username email')
-        .lean(),
-      MatchingIncomeRecord.countDocuments(filter)
+    // Execute query with population
+    const records = await MatchingIncomeRecord.find(query)
+      .populate('userId', 'username email personalInfo')
+      .populate('plotId', 'plotNumber plotName')
+      .populate('buyerId', 'username personalInfo')
+      .populate('triggeredByPlotId', 'plotNumber plotName')
+      .populate('pairedWith.plotId', 'plotNumber plotName')
+      .populate('pairedWith.buyerId', 'username personalInfo')
+      .populate('approvedBy', 'username')
+      .populate('rejectedBy', 'username')
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
+
+    // Get total count for pagination
+    const totalRecords = await MatchingIncomeRecord.countDocuments(query);
+
+    // Calculate summary statistics
+    const summaryPipeline = [
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalIncome: { $sum: '$incomeAmount' },
+          totalRecords: { $sum: 1 },
+          totalSales: { $sum: '$saleAmount' }
+        }
+      }
+    ];
+
+    const summaryResult = await MatchingIncomeRecord.aggregate(summaryPipeline);
+    const summary = summaryResult[0] || { totalIncome: 0, totalRecords: 0, totalSales: 0 };
+
+    // Income by type
+    const incomeByType = await MatchingIncomeRecord.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: '$incomeType',
+          total: { $sum: '$incomeAmount' },
+          count: { $sum: 1 }
+        }
+      }
     ]);
+
+    summary.incomeByType = {};
+    incomeByType.forEach(item => {
+      summary.incomeByType[item._id] = item.total;
+    });
+
+    // Income by status
+    const incomeByStatus = await MatchingIncomeRecord.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: '$status',
+          total: { $sum: '$incomeAmount' },
+          count: { $sum: 1 }
+        }
+      }
+    ]);
+
+    summary.incomeByStatus = {};
+    incomeByStatus.forEach(item => {
+      summary.incomeByStatus[item._id] = item.total;
+    });
+
+    // Eligible for approval
+    const eligibleRecords = await MatchingIncomeRecord.find({
+      ...query,
+      status: { $in: ['pending', 'eligible'] },
+      eligibleForApprovalDate: { $lte: new Date() }
+    });
+
+    summary.eligibleForApproval = {
+      count: eligibleRecords.length,
+      amount: eligibleRecords.reduce((sum, r) => sum + r.incomeAmount, 0)
+    };
+
+    res.status(200).json({
+      success: true,
+      data: records,
+      summary,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(totalRecords / limit),
+        totalRecords,
+        limit: parseInt(limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('Error in getUserMatchingIncome:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch income records'
+    });
+  }
+};
+
+/**
+ * Get income details for a specific plot
+ * GET /api/matching-income/plot/:plotId
+ */
+export const getPlotIncomeDetails = async (req, res) => {
+  try {
+    const { plotId } = req.params;
+
+    // Get all income records generated by this plot
+    const records = await MatchingIncomeRecord.find({
+      $or: [
+        { plotId },
+        { triggeredByPlotId: plotId },
+        { 'pairedWith.plotId': plotId }
+      ]
+    })
+      .populate('userId', 'username email personalInfo')
+      .populate('plotId', 'plotNumber plotName')
+      .populate('buyerId', 'username personalInfo')
+      .populate('triggeredByPlotId', 'plotNumber plotName')
+      .sort({ saleDate: -1 })
+      .lean();
+
+    // Get plot details
+    const plot = await Plot.findById(plotId)
+      .populate('bookingDetails.buyerId', 'username personalInfo')
+      .lean();
+
+    if (!plot) {
+      return res.status(404).json({
+        success: false,
+        message: 'Plot not found'
+      });
+    }
 
     // Calculate totals
-    const allRecords = await MatchingIncomeRecord.find({ userId }).lean();
-    
-    const totalIncome = allRecords.reduce((sum, record) => sum + record.incomeAmount, 0);
-    const paidIncome = allRecords
-      .filter(r => r.status === 'paid' || r.status === 'credited')
-      .reduce((sum, record) => sum + record.incomeAmount, 0);
-    const pendingIncome = allRecords
-      .filter(r => r.status === 'calculated' || r.status === 'pending' || r.status === 'approved')
-      .reduce((sum, record) => sum + record.incomeAmount, 0);
-
-    // Separate income by type
-    const personalSaleIncome = allRecords
+    const totalIncome = records.reduce((sum, r) => sum + r.incomeAmount, 0);
+    const personalSaleIncome = records
       .filter(r => r.incomeType === 'personal_sale')
       .reduce((sum, r) => sum + r.incomeAmount, 0);
-    
-    const matchingBonusIncome = allRecords
+    const matchingBonusIncome = records
       .filter(r => r.incomeType === 'matching_bonus')
       .reduce((sum, r) => sum + r.incomeAmount, 0);
 
-    // Get leg statistics (only from matching_bonus records)
-    const matchingRecords = allRecords.filter(r => r.incomeType === 'matching_bonus');
-    const leftLegTotal = matchingRecords.reduce((sum, r) => sum + (r.leftLeg?.totalSales || 0), 0);
-    const rightLegTotal = matchingRecords.reduce((sum, r) => sum + (r.rightLeg?.totalSales || 0), 0);
-
-    return res.status(200).json({
+    res.status(200).json({
       success: true,
-      message: records.length > 0 
-        ? 'Matching income records retrieved successfully.' 
-        : 'No matching income records found.',
-      data: records,
-      pagination: {
-        currentPage: parseInt(page),
-        totalPages: Math.ceil(totalRecords / parseInt(limit)),
-        totalRecords,
-        recordsPerPage: parseInt(limit)
-      },
-      summary: {
-        totalRecords: allRecords.length,
-        totalIncome,
-        paidIncome,
-        pendingIncome,
-        personalSaleIncome,
-        matchingBonusIncome,
-        leftLegTotalSales: leftLegTotal,
-        rightLegTotalSales: rightLegTotal,
-        legBalance: Math.abs(leftLegTotal - rightLegTotal)
+      data: {
+        plot,
+        records,
+        summary: {
+          totalIncome,
+          personalSaleIncome,
+          matchingBonusIncome,
+          totalRecords: records.length
+        }
       }
     });
 
   } catch (error) {
-    console.error("❌ Error fetching user matching income:", error);
-    return res.status(500).json({ 
+    console.error('Error in getPlotIncomeDetails:', error);
+    res.status(500).json({
       success: false,
-      message: "Internal server error.", 
-      error: error.message 
+      message: error.message || 'Failed to fetch plot income details'
     });
   }
 };
 
-// Get team matching income (all downline members)
-const getTeamMatchingIncome = async (req, res) => {
+/**
+ * Get income summary grouped by time period
+ * GET /api/matching-income/summary/:userId
+ */
+export const getIncomeSummary = async (req, res) => {
   try {
     const { userId } = req.params;
-    const { cycleStartDate, cycleEndDate, status, incomeType } = req.query;
+    const { startDate, endDate, groupBy = 'month' } = req.query;
 
-    if (!mongoose.Types.ObjectId.isValid(userId)) {
-      return res.status(400).json({ 
-        success: false,
-        message: 'Invalid User ID format.' 
-      });
+    const matchStage = { userId: new mongoose.Types.ObjectId(userId) };
+
+    if (startDate || endDate) {
+      matchStage.saleDate = {};
+      if (startDate) matchStage.saleDate.$gte = new Date(startDate);
+      if (endDate) matchStage.saleDate.$lte = new Date(endDate);
     }
 
-    // Get all team members
-    const leftTeam = await getAllDownlineMembers(userId, 'left');
-    const rightTeam = await getAllDownlineMembers(userId, 'right');
-    const allTeamIds = [...leftTeam, ...rightTeam].map(m => m._id);
+    // Determine grouping format
+    let dateFormat;
+    switch (groupBy) {
+      case 'day':
+        dateFormat = { $dateToString: { format: '%Y-%m-%d', date: '$saleDate' } };
+        break;
+      case 'year':
+        dateFormat = { $dateToString: { format: '%Y', date: '$saleDate' } };
+        break;
+      default: // month
+        dateFormat = { $dateToString: { format: '%Y-%m', date: '$saleDate' } };
+    }
 
-    if (allTeamIds.length === 0) {
-      return res.status(200).json({
-        success: true,
-        message: 'No team members found.',
-        data: {
-          personal: [],
-          team: []
-        },
-        summary: {
-          totalTeamMembers: 0,
-          totalTeamIncome: 0
+    const pipeline = [
+      { $match: matchStage },
+      {
+        $group: {
+          _id: {
+            period: dateFormat,
+            incomeType: '$incomeType',
+            status: '$status'
+          },
+          totalIncome: { $sum: '$incomeAmount' },
+          totalSales: { $sum: '$saleAmount' },
+          count: { $sum: 1 }
         }
-      });
-    }
-
-    // Build filter
-    const filter = { userId: { $in: allTeamIds } };
-
-    if (cycleStartDate) {
-      const start = new Date(cycleStartDate);
-      start.setHours(0, 0, 0, 0);
-      filter.cycleStartDate = { $gte: start };
-    }
-    
-    if (cycleEndDate) {
-      const end = new Date(cycleEndDate);
-      end.setHours(23, 59, 59, 999);
-      filter.cycleEndDate = { ...filter.cycleEndDate, $lte: end };
-    }
-    
-    if (status) {
-      filter.status = status;
-    }
-
-    if (incomeType) {
-      filter.incomeType = incomeType;
-    }
-
-    // Get team records
-    const teamRecords = await MatchingIncomeRecord.find(filter)
-      .sort({ incomeAmount: -1 })
-      .populate('userId', 'username email memberId personalInfo position')
-      .lean();
-
-    // Get personal records
-    const personalFilter = { userId: userId };
-    if (cycleStartDate) {
-      const start = new Date(cycleStartDate);
-      start.setHours(0, 0, 0, 0);
-      personalFilter.cycleStartDate = { $gte: start };
-    }
-    if (cycleEndDate) {
-      const end = new Date(cycleEndDate);
-      end.setHours(23, 59, 59, 999);
-      personalFilter.cycleEndDate = { ...personalFilter.cycleEndDate, $lte: end };
-    }
-    if (status) personalFilter.status = status;
-    if (incomeType) personalFilter.incomeType = incomeType;
-
-    const personalRecords = await MatchingIncomeRecord.find(personalFilter)
-      .sort({ cycleEndDate: -1 })
-      .populate('userId', 'username email memberId personalInfo')
-      .lean();
-
-    // Calculate statistics
-    const totalTeamIncome = teamRecords.reduce((sum, record) => sum + record.incomeAmount, 0);
-    const leftTeamIncome = teamRecords
-      .filter(r => leftTeam.some(m => m._id.toString() === r.userId._id.toString()))
-      .reduce((sum, record) => sum + record.incomeAmount, 0);
-    const rightTeamIncome = teamRecords
-      .filter(r => rightTeam.some(m => m._id.toString() === r.userId._id.toString()))
-      .reduce((sum, record) => sum + record.incomeAmount, 0);
-
-    return res.status(200).json({
-      success: true,
-      message: 'Team matching income retrieved successfully.',
-      data: {
-        personal: personalRecords,
-        team: teamRecords
       },
-      summary: {
-        totalTeamMembers: allTeamIds.length,
-        leftTeamMembers: leftTeam.length,
-        rightTeamMembers: rightTeam.length,
-        totalTeamIncome,
-        leftTeamIncome,
-        rightTeamIncome,
-        personalIncome: personalRecords.reduce((sum, r) => sum + r.incomeAmount, 0)
+      { $sort: { '_id.period': 1 } }
+    ];
+
+    const results = await MatchingIncomeRecord.aggregate(pipeline);
+
+    // Transform results into a more readable format
+    const summary = {};
+    results.forEach(item => {
+      const period = item._id.period;
+      if (!summary[period]) {
+        summary[period] = {
+          period,
+          totalIncome: 0,
+          totalSales: 0,
+          totalRecords: 0,
+          byType: {},
+          byStatus: {}
+        };
       }
+
+      summary[period].totalIncome += item.totalIncome;
+      summary[period].totalSales += item.totalSales;
+      summary[period].totalRecords += item.count;
+
+      if (!summary[period].byType[item._id.incomeType]) {
+        summary[period].byType[item._id.incomeType] = 0;
+      }
+      summary[period].byType[item._id.incomeType] += item.totalIncome;
+
+      if (!summary[period].byStatus[item._id.status]) {
+        summary[period].byStatus[item._id.status] = 0;
+      }
+      summary[period].byStatus[item._id.status] += item.totalIncome;
+    });
+
+    res.status(200).json({
+      success: true,
+      data: Object.values(summary),
+      groupBy
     });
 
   } catch (error) {
-    console.error("❌ Error fetching team matching income:", error);
-    return res.status(500).json({ 
+    console.error('Error in getIncomeSummary:', error);
+    res.status(500).json({
       success: false,
-      message: "Internal server error.", 
-      error: error.message 
+      message: error.message || 'Failed to fetch income summary'
     });
   }
 };
 
-// ==================== ADMIN FUNCTIONS ====================
-
-// Get matching income for cycle (admin)
-const getMatchingIncomeForCycle = async (req, res) => {
+/**
+ * Get team income records (all downline members)
+ * GET /api/matching-income/team/:userId
+ */
+export const getTeamMatchingIncome = async (req, res) => {
   try {
-    const { cycleStartDate, cycleEndDate, status, incomeType, page = 1, limit = 50 } = req.query;
+    const { userId } = req.params;
+    const {
+      incomeType,
+      status,
+      legType,
+      startDate,
+      endDate,
+      memberId,
+      page = 1,
+      limit = 50,
+      sortBy = 'saleDate',
+      sortOrder = 'desc'
+    } = req.query;
 
-    const filter = {};
+    // Get all team members (downline)
+    const teamMembers = await getAllDownlineMembers(userId);
+    const teamMemberIds = teamMembers.map(m => m._id);
+    teamMemberIds.push(new mongoose.Types.ObjectId(userId)); // Include the user
 
-    if (cycleStartDate && cycleEndDate) {
-      const start = new Date(cycleStartDate);
-      start.setHours(0, 0, 0, 0);
-      const end = new Date(cycleEndDate);
-      end.setHours(23, 59, 59, 999);
+    // Build query
+    const query = { userId: { $in: teamMemberIds } };
 
-      filter.cycleStartDate = { $gte: start };
-      filter.cycleEndDate = { $lte: end };
+    if (incomeType) query.incomeType = incomeType;
+    if (status) query.status = status;
+    if (legType) query.legType = legType;
+    if (memberId) query.userId = memberId;
+    if (startDate || endDate) {
+      query.saleDate = {};
+      if (startDate) query.saleDate.$gte = new Date(startDate);
+      if (endDate) query.saleDate.$lte = new Date(endDate);
     }
 
-    if (status) {
-      filter.status = status;
-    }
+    // Pagination
+    const skip = (page - 1) * limit;
+    const sortOptions = { [sortBy]: sortOrder === 'asc' ? 1 : -1 };
 
-    if (incomeType) {
-      filter.incomeType = incomeType;
-    }
+    // Execute query
+    const records = await MatchingIncomeRecord.find(query)
+      .populate('userId', 'username email personalInfo')
+      .populate('plotId', 'plotNumber plotName')
+      .populate('buyerId', 'username personalInfo')
+      .populate('triggeredByPlotId', 'plotNumber plotName')
+      .populate('pairedWith.plotId', 'plotNumber plotName')
+      .populate('pairedWith.buyerId', 'username personalInfo')
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
 
-    const skip = (parseInt(page) - 1) * parseInt(limit);
+    const totalRecords = await MatchingIncomeRecord.countDocuments(query);
 
-    const [records, totalRecords] = await Promise.all([
-      MatchingIncomeRecord.find(filter)
-        .populate('userId', 'username email memberId personalInfo position')
-        .populate('approvedBy', 'username email')
-        .sort({ incomeAmount: -1 })
-        .skip(skip)
-        .limit(parseInt(limit))
-        .lean(),
-      MatchingIncomeRecord.countDocuments(filter)
+    // Calculate team summary
+    const summaryPipeline = [
+      { $match: query },
+      {
+        $group: {
+          _id: null,
+          totalTeamIncome: { $sum: '$incomeAmount' },
+          totalTeamSales: { $sum: '$saleAmount' },
+          totalTeamRecords: { $sum: 1 }
+        }
+      }
+    ];
+
+    const summaryResult = await MatchingIncomeRecord.aggregate(summaryPipeline);
+    const summary = summaryResult[0] || { 
+      totalTeamIncome: 0, 
+      totalTeamSales: 0, 
+      totalTeamRecords: 0 
+    };
+
+    // Income by type
+    const incomeByType = await MatchingIncomeRecord.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: '$incomeType',
+          total: { $sum: '$incomeAmount' }
+        }
+      }
     ]);
 
-    // Statistics
-    const allFilteredRecords = await MatchingIncomeRecord.find(filter).lean();
+    summary.incomeByType = {};
+    incomeByType.forEach(item => {
+      summary.incomeByType[item._id] = item.total;
+    });
 
-    const totalIncome = allFilteredRecords.reduce((sum, record) => sum + record.incomeAmount, 0);
-    const personalSaleTotal = allFilteredRecords
-      .filter(r => r.incomeType === 'personal_sale')
-      .reduce((sum, r) => sum + r.incomeAmount, 0);
-    const matchingBonusTotal = allFilteredRecords
-      .filter(r => r.incomeType === 'matching_bonus')
-      .reduce((sum, r) => sum + r.incomeAmount, 0);
+    // Income by status
+    const incomeByStatus = await MatchingIncomeRecord.aggregate([
+      { $match: query },
+      {
+        $group: {
+          _id: '$status',
+          total: { $sum: '$incomeAmount' }
+        }
+      }
+    ]);
 
-    const statusBreakdown = allFilteredRecords.reduce((acc, record) => {
-      acc[record.status] = (acc[record.status] || 0) + 1;
-      return acc;
-    }, {});
+    summary.incomeByStatus = {};
+    incomeByStatus.forEach(item => {
+      summary.incomeByStatus[item._id] = item.total;
+    });
 
-    const topEarners = allFilteredRecords
-      .sort((a, b) => b.incomeAmount - a.incomeAmount)
-      .slice(0, 10)
-      .map(r => ({
-        userId: r.userId?._id || r.userId,
-        username: r.userId?.username || 'Unknown',
-        income: r.incomeAmount,
-        incomeType: r.incomeType,
-        cycle: `${new Date(r.cycleStartDate).toLocaleDateString()} - ${new Date(r.cycleEndDate).toLocaleDateString()}`
-      }));
+    // Team stats
+    summary.totalTeamMembers = teamMemberIds.length;
+    summary.activeMembers = await User.countDocuments({
+      _id: { $in: teamMemberIds },
+      isActive: true
+    });
 
-    return res.status(200).json({
+    res.status(200).json({
       success: true,
-      message: "Matching income records retrieved successfully.",
+      data: records,
+      summary,
+      pagination: {
+        currentPage: parseInt(page),
+        totalPages: Math.ceil(totalRecords / limit),
+        totalRecords,
+        limit: parseInt(limit)
+      }
+    });
+
+  } catch (error) {
+    console.error('Error in getTeamMatchingIncome:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch team income'
+    });
+  }
+};
+
+/* ============================================================================ */
+/* 🔶 ADMIN CONTROLLERS                                                        */
+/* ============================================================================ */
+
+/**
+ * Get all income records with advanced filtering (Admin Only)
+ * GET /api/matching-income/admin/all
+ */
+export const getAllIncomeRecords = async (req, res) => {
+  try {
+    const {
+      incomeType,
+      status,
+      legType,
+      eligibleOnly,
+      startDate,
+      endDate,
+      page = 1,
+      limit = 50,
+      sortBy = 'saleDate',
+      sortOrder = 'desc',
+      search
+    } = req.query;
+
+    // Build query
+    const query = {};
+
+    if (incomeType) query.incomeType = incomeType;
+    if (status) query.status = status;
+    if (legType) query.legType = legType;
+    if (startDate || endDate) {
+      query.saleDate = {};
+      if (startDate) query.saleDate.$gte = new Date(startDate);
+      if (endDate) query.saleDate.$lte = new Date(endDate);
+    }
+
+    // Eligible only filter
+    if (eligibleOnly === 'true') {
+      query.status = { $in: ['pending', 'eligible'] };
+      query.eligibleForApprovalDate = { $lte: new Date() };
+    }
+
+    // Search filter
+    if (search) {
+      const users = await User.find({
+        $or: [
+          { username: { $regex: search, $options: 'i' } },
+          { email: { $regex: search, $options: 'i' } }
+        ]
+      }).select('_id');
+
+      const userIds = users.map(u => u._id);
+
+      query.$or = [
+        { plotNumber: { $regex: search, $options: 'i' } },
+        { userId: { $in: userIds } }
+      ];
+    }
+
+    // Pagination
+    const skip = (page - 1) * limit;
+    const sortOptions = { [sortBy]: sortOrder === 'asc' ? 1 : -1 };
+
+    // Execute query
+    const records = await MatchingIncomeRecord.find(query)
+      .populate('userId', 'username email personalInfo')
+      .populate('plotId', 'plotNumber plotName pricing')
+      .populate('buyerId', 'username personalInfo')
+      .populate('triggeredByPlotId', 'plotNumber plotName')
+      .populate('pairedWith.plotId', 'plotNumber plotName')
+      .populate('pairedWith.buyerId', 'username personalInfo')
+      .populate('approvedBy', 'username')
+      .populate('rejectedBy', 'username')
+      .sort(sortOptions)
+      .skip(skip)
+      .limit(parseInt(limit))
+      .lean();
+
+    const totalRecords = await MatchingIncomeRecord.countDocuments(query);
+
+    res.status(200).json({
+      success: true,
       data: records,
       pagination: {
         currentPage: parseInt(page),
-        totalPages: Math.ceil(totalRecords / parseInt(limit)),
+        totalPages: Math.ceil(totalRecords / limit),
         totalRecords,
-        recordsPerPage: parseInt(limit)
-      },
-      summary: {
-        ...(cycleStartDate && cycleEndDate && { 
-          cycleStart: cycleStartDate, 
-          cycleEnd: cycleEndDate 
-        }),
-        totalRecords: allFilteredRecords.length,
-        totalIncome,
-        personalSaleTotal,
-        matchingBonusTotal,
-        averageIncome: (totalRecords > 0 ? (totalIncome / totalRecords).toFixed(2) : 0),
-        statusBreakdown,
-        topEarners
+        limit: parseInt(limit)
       }
     });
 
   } catch (error) {
-    console.error("❌ Error fetching cycle matching income:", error);
-    return res.status(500).json({
+    console.error('Error in getAllIncomeRecords:', error);
+    res.status(500).json({
       success: false,
-      message: "Internal server error.",
-      error: error.message
+      message: error.message || 'Failed to fetch income records'
     });
   }
 };
 
-// Approve matching income (FIXED - uses updateOne)
-const approveMatchingIncome = async (req, res) => {
+/**
+ * Get dashboard statistics (Admin Only)
+ * GET /api/matching-income/admin/stats
+ */
+export const getDashboardStats = async (req, res) => {
+  try {
+    const now = new Date();
+    const currentMonthStart = new Date(now.getFullYear(), now.getMonth(), 1);
+    const lastMonthStart = new Date(now.getFullYear(), now.getMonth() - 1, 1);
+    const lastMonthEnd = new Date(now.getFullYear(), now.getMonth(), 0);
+
+    // Overall statistics
+    const overallStats = await MatchingIncomeRecord.aggregate([
+      {
+        $group: {
+          _id: null,
+          totalRecords: { $sum: 1 },
+          totalIncome: { $sum: '$incomeAmount' },
+          totalSales: { $sum: '$saleAmount' }
+        }
+      }
+    ]);
+
+    // Current month stats
+    const currentMonthStats = await MatchingIncomeRecord.aggregate([
+      { $match: { createdAt: { $gte: currentMonthStart } } },
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 },
+          totalIncome: { $sum: '$incomeAmount' }
+        }
+      }
+    ]);
+
+    // Last month stats
+    const lastMonthStats = await MatchingIncomeRecord.aggregate([
+      { 
+        $match: { 
+          createdAt: { 
+            $gte: lastMonthStart,
+            $lte: lastMonthEnd
+          } 
+        } 
+      },
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 },
+          totalIncome: { $sum: '$incomeAmount' }
+        }
+      }
+    ]);
+
+    // Eligible for approval
+    const eligibleRecords = await MatchingIncomeRecord.find({
+      status: { $in: ['pending', 'eligible'] },
+      eligibleForApprovalDate: { $lte: now }
+    });
+
+    const eligibleForApproval = {
+      count: eligibleRecords.length,
+      amount: eligibleRecords.reduce((sum, r) => sum + r.incomeAmount, 0)
+    };
+
+    // Status breakdown
+    const statusBreakdown = await MatchingIncomeRecord.aggregate([
+      {
+        $group: {
+          _id: '$status',
+          count: { $sum: 1 },
+          totalIncome: { $sum: '$incomeAmount' }
+        }
+      }
+    ]);
+
+    // Income type breakdown
+    const typeBreakdown = await MatchingIncomeRecord.aggregate([
+      {
+        $group: {
+          _id: '$incomeType',
+          count: { $sum: 1 },
+          totalIncome: { $sum: '$incomeAmount' }
+        }
+      }
+    ]);
+
+    // Unique users count
+    const uniqueUsers = await MatchingIncomeRecord.distinct('userId');
+
+    // Format response
+    const overall = overallStats[0] || { totalRecords: 0, totalIncome: 0, totalSales: 0 };
+    overall.uniqueUsers = uniqueUsers.length;
+
+    const currentMonth = {};
+    currentMonthStats.forEach(stat => {
+      currentMonth[stat._id] = {
+        count: stat.count,
+        totalIncome: stat.totalIncome
+      };
+    });
+
+    const lastMonth = {};
+    lastMonthStats.forEach(stat => {
+      lastMonth[stat._id] = {
+        count: stat.count,
+        totalIncome: stat.totalIncome
+      };
+    });
+
+    const statusBreakdownObj = {};
+    statusBreakdown.forEach(stat => {
+      statusBreakdownObj[stat._id] = {
+        count: stat.count,
+        totalIncome: stat.totalIncome
+      };
+    });
+
+    const typeBreakdownObj = {};
+    typeBreakdown.forEach(stat => {
+      typeBreakdownObj[stat._id] = {
+        count: stat.count,
+        totalIncome: stat.totalIncome
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        overall,
+        currentMonth,
+        lastMonth,
+        eligibleForApproval,
+        statusBreakdown: statusBreakdownObj,
+        typeBreakdown: typeBreakdownObj
+      }
+    });
+
+  } catch (error) {
+    console.error('Error in getDashboardStats:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch dashboard stats'
+    });
+  }
+};
+
+/**
+ * Approve a single income record (Admin Only)
+ * PATCH /api/matching-income/admin/approve/:recordId
+ */
+export const approveMatchingIncome = async (req, res) => {
   try {
     const { recordId } = req.params;
-    const { adminId } = req.body;
+    const { adminId, notes } = req.body;
 
-    if (!mongoose.Types.ObjectId.isValid(recordId)) {
-      return res.status(400).json({ 
+    if (!adminId) {
+      return res.status(400).json({
         success: false,
-        message: 'Invalid record ID.' 
+        message: 'Admin ID is required'
+      });
+    }
+
+    // Find the record
+    const record = await MatchingIncomeRecord.findById(recordId);
+
+    if (!record) {
+      return res.status(404).json({
+        success: false,
+        message: 'Income record not found'
+      });
+    }
+
+    // Check if already approved
+    if (record.status === 'approved' || record.status === 'credited' || record.status === 'paid') {
+      return res.status(400).json({
+        success: false,
+        message: 'Income record is already approved'
+      });
+    }
+
+    // Check 3-month lock
+    const now = new Date();
+    const eligibleDate = new Date(record.eligibleForApprovalDate);
+
+    if (now < eligibleDate) {
+      const daysRemaining = Math.ceil((eligibleDate - now) / (1000 * 60 * 60 * 24));
+      return res.status(400).json({
+        success: false,
+        message: `Cannot approve yet. Income becomes eligible in ${daysRemaining} days (on ${eligibleDate.toLocaleDateString()})`
+      });
+    }
+
+    // Update record
+    record.status = 'approved';
+    record.approvedBy = adminId;
+    record.approvedAt = now;
+    if (notes) record.adminNotes = notes;
+
+    await record.save();
+
+    // Populate before returning
+    await record.populate([
+      { path: 'userId', select: 'username email personalInfo' },
+      { path: 'approvedBy', select: 'username' }
+    ]);
+
+    res.status(200).json({
+      success: true,
+      message: 'Income approved successfully',
+      data: record
+    });
+
+  } catch (error) {
+    console.error('Error in approveMatchingIncome:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to approve income'
+    });
+  }
+};
+
+/**
+ * Bulk approve multiple income records (Admin Only)
+ * POST /api/matching-income/admin/bulk-approve
+ */
+export const bulkApproveIncome = async (req, res) => {
+  try {
+    const { adminId, recordIds, notes } = req.body;
+
+    if (!adminId || !recordIds || !Array.isArray(recordIds) || recordIds.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: 'Admin ID and record IDs are required'
+      });
+    }
+
+    const now = new Date();
+    const results = {
+      approved: 0,
+      skipped: 0,
+      failed: 0,
+      details: []
+    };
+
+    // Process each record
+    for (const recordId of recordIds) {
+      try {
+        const record = await MatchingIncomeRecord.findById(recordId);
+
+        if (!record) {
+          results.failed++;
+          results.details.push({
+            recordId,
+            status: 'failed',
+            message: 'Record not found'
+          });
+          continue;
+        }
+
+        // Check if already approved
+        if (['approved', 'credited', 'paid'].includes(record.status)) {
+          results.skipped++;
+          results.details.push({
+            recordId,
+            status: 'skipped',
+            message: 'Already approved'
+          });
+          continue;
+        }
+
+        // Check 3-month lock
+        const eligibleDate = new Date(record.eligibleForApprovalDate);
+        if (now < eligibleDate) {
+          results.skipped++;
+          results.details.push({
+            recordId,
+            status: 'skipped',
+            message: 'Not eligible yet (3-month lock)'
+          });
+          continue;
+        }
+
+        // Approve the record
+        record.status = 'approved';
+        record.approvedBy = adminId;
+        record.approvedAt = now;
+        if (notes) record.adminNotes = notes;
+
+        await record.save();
+
+        results.approved++;
+        results.details.push({
+          recordId,
+          status: 'approved',
+          message: 'Successfully approved'
+        });
+
+      } catch (err) {
+        results.failed++;
+        results.details.push({
+          recordId,
+          status: 'failed',
+          message: err.message
+        });
+      }
+    }
+
+    res.status(200).json({
+      success: true,
+      message: `Bulk approval completed: ${results.approved} approved, ${results.skipped} skipped, ${results.failed} failed`,
+      data: results
+    });
+
+  } catch (error) {
+    console.error('Error in bulkApproveIncome:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to bulk approve income'
+    });
+  }
+};
+
+/**
+ * Reject an income record (Admin Only)
+ * PATCH /api/matching-income/admin/reject/:recordId
+ */
+export const rejectMatchingIncome = async (req, res) => {
+  try {
+    const { recordId } = req.params;
+    const { adminId, reason } = req.body;
+
+    if (!adminId || !reason) {
+      return res.status(400).json({
+        success: false,
+        message: 'Admin ID and rejection reason are required'
       });
     }
 
     const record = await MatchingIncomeRecord.findById(recordId);
-    
+
     if (!record) {
-      return res.status(404).json({ 
+      return res.status(404).json({
         success: false,
-        message: 'Matching income record not found.' 
+        message: 'Income record not found'
       });
     }
 
-    if (record.status !== 'calculated' && record.status !== 'pending') {
-      return res.status(400).json({ 
-        success: false,
-        message: `Cannot approve record with status: ${record.status}` 
-      });
-    }
+    // Update record
+    record.status = 'rejected';
+    record.rejectedBy = adminId;
+    record.rejectedAt = new Date();
+    record.rejectionReason = reason;
 
-    // Use updateOne to avoid validation issues
-    await MatchingIncomeRecord.updateOne(
-      { _id: recordId },
-      { 
-        $set: {
-          status: 'approved',
-          approvedBy: adminId,
-          approvedAt: new Date()
-        }
-      }
-    );
+    await record.save();
 
-    // Fetch updated record
-    const updatedRecord = await MatchingIncomeRecord.findById(recordId)
-      .populate('userId', 'username email')
-      .populate('approvedBy', 'username email');
+    // Populate before returning
+    await record.populate([
+      { path: 'userId', select: 'username email personalInfo' },
+      { path: 'rejectedBy', select: 'username' }
+    ]);
 
-    return res.status(200).json({
+    res.status(200).json({
       success: true,
-      message: 'Matching income approved successfully.',
-      data: updatedRecord
+      message: 'Income rejected successfully',
+      data: record
     });
 
   } catch (error) {
-    console.error("❌ Error approving matching income:", error);
-    return res.status(500).json({ 
+    console.error('Error in rejectMatchingIncome:', error);
+    res.status(500).json({
       success: false,
-      message: "Internal server error.", 
-      error: error.message 
+      message: error.message || 'Failed to reject income'
     });
   }
 };
 
-// Delete matching income for cycle
-const deleteMatchingIncomeForCycle = async (req, res) => {
+/**
+ * Update income status to credited/paid (Admin Only)
+ * PATCH /api/matching-income/admin/status/:recordId
+ */
+export const updateIncomeStatus = async (req, res) => {
   try {
-    const { cycleStartDate, cycleEndDate } = req.query;
+    const { recordId } = req.params;
+    const { status, paymentDetails } = req.body;
 
-    if (!cycleStartDate || !cycleEndDate) {
-      return res.status(400).json({ 
+    if (!status) {
+      return res.status(400).json({
         success: false,
-        message: "cycleStartDate and cycleEndDate are required." 
+        message: 'Status is required'
       });
     }
 
-    const start = new Date(cycleStartDate);
-    start.setHours(0, 0, 0, 0);
-    const end = new Date(cycleEndDate);
-    end.setHours(23, 59, 59, 999);
+    // Validate status
+    const validStatuses = ['credited', 'paid'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Status must be one of: ${validStatuses.join(', ')}`
+      });
+    }
 
-    const filter = {
-      cycleStartDate: { $gte: start },
-      cycleEndDate: { $lte: end }
-    };
+    const record = await MatchingIncomeRecord.findById(recordId);
 
-    const result = await MatchingIncomeRecord.deleteMany(filter);
+    if (!record) {
+      return res.status(404).json({
+        success: false,
+        message: 'Income record not found'
+      });
+    }
 
-    console.log(`🗑️ Deleted ${result.deletedCount} matching income records for cycle`);
+    // Check if record is approved
+    if (record.status !== 'approved' && record.status !== 'credited') {
+      return res.status(400).json({
+        success: false,
+        message: 'Only approved or credited income can be updated'
+      });
+    }
 
-    return res.status(200).json({
+    // Update status
+    record.status = status;
+
+    // Update payment details if provided
+    if (status === 'paid' && paymentDetails) {
+      record.paymentDetails = {
+        paidAmount: paymentDetails.paidAmount || record.incomeAmount,
+        paidDate: paymentDetails.paidDate || new Date(),
+        transactionId: paymentDetails.transactionId,
+        paymentMode: paymentDetails.paymentMode
+      };
+    }
+
+    await record.save();
+
+    // Populate before returning
+    await record.populate([
+      { path: 'userId', select: 'username email personalInfo' }
+    ]);
+
+    res.status(200).json({
       success: true,
-      message: `Successfully deleted ${result.deletedCount} matching income records.`,
-      deletedCount: result.deletedCount,
-      cycle: { start: cycleStartDate, end: cycleEndDate }
+      message: `Income status updated to ${status} successfully`,
+      data: record
     });
 
   } catch (error) {
-    console.error("❌ Error deleting matching income:", error);
-    return res.status(500).json({ 
+    console.error('Error in updateIncomeStatus:', error);
+    res.status(500).json({
       success: false,
-      message: "Internal server error.", 
-      error: error.message 
+      message: error.message || 'Failed to update income status'
     });
   }
 };
 
-// Recalculate matching income
-const recalculateMatchingIncome = async (req, res) => {
-  try {
-    const now = new Date();
-    const cycleStartDate = new Date(now.getFullYear(), now.getMonth(), 1);
-    const cycleEndDate = new Date(now.getFullYear(), now.getMonth() + 1, 0);
-    cycleEndDate.setHours(23, 59, 59, 999);
+/* ============================================================================ */
+/* 🔧 HELPER FUNCTIONS                                                         */
+/* ============================================================================ */
 
-    console.log(`\n🔄 RECALCULATING Matching Income for cycle: ${cycleStartDate.toISOString()} to ${cycleEndDate.toISOString()}`);
-
-    // Delete existing records
-    const deleteResult = await MatchingIncomeRecord.deleteMany({
-      cycleStartDate: { $gte: cycleStartDate },
-      cycleEndDate: { $lte: cycleEndDate }
-    });
-
-    console.log(`🗑️ Deleted ${deleteResult.deletedCount} existing records`);
-
-    // Proceed with calculation
-    req.skipDuplicateCheck = true;
-    return calculateMatchingIncomeForCycle(req, res);
-
-  } catch (error) {
-    console.error("❌ Error recalculating matching income:", error);
-    return res.status(500).json({ 
-      success: false,
-      message: "Internal server error.", 
-      error: error.message 
-    });
+/**
+ * Get all downline members recursively
+ */
+async function getAllDownlineMembers(userId, visited = new Set()) {
+  const members = [];
+  
+  if (visited.has(userId.toString())) {
+    return members;
   }
-};
+  
+  visited.add(userId.toString());
+  
+  const children = await User.find({ sponsorId: userId })
+    .select('_id username position')
+    .lean();
+  
+  for (const child of children) {
+    members.push(child);
+    const descendants = await getAllDownlineMembers(child._id, visited);
+    members.push(...descendants);
+  }
+  
+  return members;
+}
 
-// ==================== EXPORTS ====================
-
-export { 
-  calculateMatchingIncomeForCycle, 
+export default {
   getUserMatchingIncome,
-  getTeamMatchingIncome, 
-  getMatchingIncomeForCycle,
+  getPlotIncomeDetails,
+  getIncomeSummary,
+  getTeamMatchingIncome,
+  getAllIncomeRecords,
+  getDashboardStats,
   approveMatchingIncome,
-  deleteMatchingIncomeForCycle,
-  recalculateMatchingIncome
+  bulkApproveIncome,
+  rejectMatchingIncome,
+  updateIncomeStatus
 };

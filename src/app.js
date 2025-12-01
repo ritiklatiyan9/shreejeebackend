@@ -1,4 +1,4 @@
-// app.js
+// app.js - Updated with Leg Balance Routes
 import express from 'express';
 import cors from 'cors';
 import bodyParser from 'body-parser';
@@ -8,10 +8,7 @@ import adminRoute from './routes/adminRoute.js';
 import kycRoute from './routes/kycRoute.js';
 import plotRoute from './routes/plotRoute.js';
 import matchingIncomeRoute from './routes/matchingIncomeRoute.js';
-
-// Remove any dotenv import/config from here if it exists
-// import { config } from 'dotenv';
-// config({ path: './.env' });
+import legBalanceRoute from './routes/legBalanceRoute.js'; // ✅ NEW ROUTE
 
 import { corsOptions } from './origin/corsOptions.js';
 
@@ -39,5 +36,6 @@ app.use('/api/v1/kyc', kycRoute);
 app.use('/api/v1/admin', adminRoute);
 app.use('/api/v1/plots', plotRoute);
 app.use('/api/v1/matching-income', matchingIncomeRoute);
+app.use('/api/v1/leg-balance', legBalanceRoute); // ✅ NEW ROUTE
 
 export { app };

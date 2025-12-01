@@ -1,9 +1,11 @@
-// models/matchingIncomeSchema.js
+// models/matchingIncomeSchema.js - Individual Transaction-Based Income Model
 import mongoose from 'mongoose';
 const { Schema } = mongoose;
 
 const matchingIncomeRecordSchema = new Schema({
-  // The user earning the matching income (sponsor/head)
+  /* -------------------------------------------------------------------------- */
+  /* 👤 USER WHO EARNS THIS INCOME                                             */
+  /* -------------------------------------------------------------------------- */
   userId: {
     type: Schema.Types.ObjectId,
     ref: 'User',
@@ -11,68 +13,81 @@ const matchingIncomeRecordSchema = new Schema({
     index: true
   },
 
-  // Cycle period for which this income is calculated
-  cycleStartDate: {
-    type: Date,
+  /* -------------------------------------------------------------------------- */
+  /* 📝 INCOME TYPE                                                            */
+  /* -------------------------------------------------------------------------- */
+  incomeType: {
+    type: String,
+    enum: ['personal_sale', 'matching_bonus'],
     required: true,
-    immutable: true
-  },
-  cycleEndDate: {
-    type: Date,
-    required: true
+    index: true
   },
 
-  // Left leg details
-  leftLeg: {
-    totalSales: { type: Number, default: 0, min: 0 },
-    totalBookings: { type: Number, default: 0 },
-    directMembers: [{
-      memberId: { type: Schema.Types.ObjectId, ref: 'User' },
-      memberName: String,
-      sales: { type: Number, default: 0 }
-    }],
-    bookingDetails: [{
-      plotId: { type: Schema.Types.ObjectId, ref: 'Plot' },
-      buyerId: { type: Schema.Types.ObjectId, ref: 'User' },
-      buyerName: String,
-      amount: { type: Number, default: 0 },
-      bookingDate: Date
-    }]
+  /* -------------------------------------------------------------------------- */
+  /* 🏠 PLOT DETAILS (For Personal Sale)                                      */
+  /* -------------------------------------------------------------------------- */
+  plotId: {
+    type: Schema.Types.ObjectId,
+    ref: 'Plot',
+    index: true
+  },
+  plotNumber: String,
+  saleAmount: {
+    type: Number,
+    default: 0,
+    min: 0
   },
 
-  // Right leg details
-  rightLeg: {
-    totalSales: { type: Number, default: 0, min: 0 },
-    totalBookings: { type: Number, default: 0 },
-    directMembers: [{
-      memberId: { type: Schema.Types.ObjectId, ref: 'User' },
-      memberName: String,
-      sales: { type: Number, default: 0 }
-    }],
-    bookingDetails: [{
-      plotId: { type: Schema.Types.ObjectId, ref: 'Plot' },
-      buyerId: { type: Schema.Types.ObjectId, ref: 'User' },
-      buyerName: String,
-      amount: { type: Number, default: 0 },
-      bookingDate: Date
-    }]
+  /* -------------------------------------------------------------------------- */
+  /* 👥 BUYER DETAILS                                                          */
+  /* -------------------------------------------------------------------------- */
+  buyerId: {
+    type: Schema.Types.ObjectId,
+    ref: 'User',
+    index: true
+  },
+  buyerName: String,
+
+  /* -------------------------------------------------------------------------- */
+  /* 🤝 MATCHING BONUS DETAILS                                                */
+  /* -------------------------------------------------------------------------- */
+  // Which plot triggered this matching income
+  triggeredByPlotId: {
+    type: Schema.Types.ObjectId,
+    ref: 'Plot'
+  },
+  triggeredByBuyerId: {
+    type: Schema.Types.ObjectId,
+    ref: 'User'
   },
 
-  // Balanced amount (can be zero if no pairing)
+  // Which leg this income came from
+  legType: {
+    type: String,
+    enum: ['personal', 'left', 'right'],
+    index: true
+  },
+
+  // Pairing information (the other leg's sale that paired with this)
+  pairedWith: {
+    plotId: { type: Schema.Types.ObjectId, ref: 'Plot' },
+    buyerId: { type: Schema.Types.ObjectId, ref: 'User' },
+    buyerName: String,
+    amount: { type: Number, default: 0 },
+    legType: { type: String, enum: ['left', 'right'] },
+    saleDate: Date
+  },
+
+  // The balanced/matched amount
   balancedAmount: {
     type: Number,
     default: 0,
     min: 0
   },
 
-  // The weaker leg (left or right)
-  weakerLeg: {
-    type: String,
-    enum: ['left', 'right', 'equal'],
-    default: 'equal'
-  },
-
-  // Commission details
+  /* -------------------------------------------------------------------------- */
+  /* 💰 INCOME CALCULATION                                                     */
+  /* -------------------------------------------------------------------------- */
   commissionPercentage: {
     type: Number,
     default: 5,
@@ -80,45 +95,55 @@ const matchingIncomeRecordSchema = new Schema({
     max: 100
   },
 
-  // Matching income amount (auto-calculated)
   incomeAmount: {
     type: Number,
+    required: true,
     default: 0,
     min: 0
   },
 
-  // Carry forward for next cycle
-  carryForward: {
-    left: { type: Number, default: 0 },
-    right: { type: Number, default: 0 }
+  /* -------------------------------------------------------------------------- */
+  /* 📅 DATE TRACKING                                                          */
+  /* -------------------------------------------------------------------------- */
+  saleDate: {
+    type: Date,
+    required: true,
+    index: true
   },
 
-  // Optional: Personal sale tracking
-  personalSales: {
-    totalSales: { type: Number, default: 0 },
-    totalBookings: { type: Number, default: 0 },
-    bookingDetails: [{
-      plotId: { type: Schema.Types.ObjectId, ref: 'Plot' },
-      amount: { type: Number, default: 0 },
-      bookingDate: Date
-    }]
+  // Date when this income becomes eligible for approval (saleDate + 3 months)
+  eligibleForApprovalDate: {
+    type: Date,
+    required: true,
+    index: true
   },
 
-  // Record type
-  incomeType: {
-    type: String,
-    enum: ['personal_sale', 'matching_bonus'],
-    default: 'matching_bonus'
-  },
-
-  // Status
+  /* -------------------------------------------------------------------------- */
+  /* ⚡ STATUS & APPROVAL                                                      */
+  /* -------------------------------------------------------------------------- */
   status: {
     type: String,
-    enum: ['pending', 'calculated', 'approved', 'credited', 'paid', 'archived'],
-    default: 'calculated'
+    enum: ['pending', 'eligible', 'approved', 'credited', 'paid', 'rejected'],
+    default: 'pending',
+    index: true
   },
 
-  // Payment tracking
+  approvedBy: { 
+    type: Schema.Types.ObjectId, 
+    ref: 'User' 
+  },
+  approvedAt: Date,
+
+  rejectedBy: { 
+    type: Schema.Types.ObjectId, 
+    ref: 'User' 
+  },
+  rejectedAt: Date,
+  rejectionReason: String,
+
+  /* -------------------------------------------------------------------------- */
+  /* 💳 PAYMENT TRACKING                                                       */
+  /* -------------------------------------------------------------------------- */
   paymentDetails: {
     paidAmount: { type: Number, default: 0 },
     paidDate: Date,
@@ -129,40 +154,68 @@ const matchingIncomeRecordSchema = new Schema({
     }
   },
 
-  // Admin approval
-  approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
-  approvedAt: Date,
-
-  // Notes
+  /* -------------------------------------------------------------------------- */
+  /* 📝 NOTES                                                                  */
+  /* -------------------------------------------------------------------------- */
   notes: String,
   adminNotes: String
 
-}, { timestamps: true });
+}, { 
+  timestamps: true,
+  toJSON: { virtuals: true },
+  toObject: { virtuals: true }
+});
 
 /* -------------------------------------------------------------------------- */
 /* 🔍 INDEXES                                                                 */
 /* -------------------------------------------------------------------------- */
-matchingIncomeRecordSchema.index({ userId: 1, cycleStartDate: -1 });
-matchingIncomeRecordSchema.index({ status: 1, cycleEndDate: -1 });
+matchingIncomeRecordSchema.index({ userId: 1, saleDate: -1 });
 matchingIncomeRecordSchema.index({ userId: 1, status: 1 });
-matchingIncomeRecordSchema.index({ cycleStartDate: 1, cycleEndDate: 1 });
+matchingIncomeRecordSchema.index({ status: 1, eligibleForApprovalDate: 1 });
+matchingIncomeRecordSchema.index({ incomeType: 1, saleDate: -1 });
+matchingIncomeRecordSchema.index({ plotId: 1 });
+matchingIncomeRecordSchema.index({ buyerId: 1 });
+matchingIncomeRecordSchema.index({ triggeredByPlotId: 1 });
 
 /* -------------------------------------------------------------------------- */
 /* 🧮 VIRTUALS & METHODS                                                      */
 /* -------------------------------------------------------------------------- */
-matchingIncomeRecordSchema.virtual('legBalanceRatio').get(function() {
-  const left = this.leftLeg?.totalSales || 0;
-  const right = this.rightLeg?.totalSales || 0;
-  if (left === 0 && right === 0) return 0;
-  const max = Math.max(left, right);
-  const min = Math.min(left, right);
-  return ((min / max) * 100).toFixed(2);
+
+// Check if income is eligible for approval
+matchingIncomeRecordSchema.virtual('isEligibleForApproval').get(function() {
+  return new Date() >= new Date(this.eligibleForApprovalDate);
 });
 
-matchingIncomeRecordSchema.methods.hasPersonalSponsor = async function() {
-  const User = mongoose.model('User');
-  const user = await User.findById(this.userId).select('sponsorId');
-  return !!user?.sponsorId;
+// Days remaining until eligible for approval
+matchingIncomeRecordSchema.virtual('daysUntilEligible').get(function() {
+  const now = new Date();
+  const eligibleDate = new Date(this.eligibleForApprovalDate);
+  const diffTime = eligibleDate - now;
+  const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+  return diffDays > 0 ? diffDays : 0;
+});
+
+// Auto-update status to 'eligible' when date passes
+matchingIncomeRecordSchema.pre('save', function(next) {
+  if (this.status === 'pending' && new Date() >= new Date(this.eligibleForApprovalDate)) {
+    this.status = 'eligible';
+  }
+  next();
+});
+
+// Static method to update all pending records to eligible
+matchingIncomeRecordSchema.statics.updateEligibleRecords = async function() {
+  const now = new Date();
+  const result = await this.updateMany(
+    {
+      status: 'pending',
+      eligibleForApprovalDate: { $lte: now }
+    },
+    {
+      $set: { status: 'eligible' }
+    }
+  );
+  return result;
 };
 
 const MatchingIncomeRecord = mongoose.model('MatchingIncomeRecord', matchingIncomeRecordSchema);

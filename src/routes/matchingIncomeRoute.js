@@ -1,49 +1,87 @@
-// routes/matchingIncomeRoutes.js
+// routes/matchingIncomeRoutes.js - Complete Routes Configuration
 import express from 'express';
 import { 
-  calculateMatchingIncomeForCycle, 
   getUserMatchingIncome,
-  getTeamMatchingIncome, 
-  getMatchingIncomeForCycle,
+  getPlotIncomeDetails,
+  getIncomeSummary,
+  getTeamMatchingIncome,
+  getAllIncomeRecords,
   approveMatchingIncome,
-  deleteMatchingIncomeForCycle,
-  recalculateMatchingIncome
+  bulkApproveIncome,
+  rejectMatchingIncome,
+  updateIncomeStatus,
+  getDashboardStats
 } from '../controllers/matchingIncomeController.js';
 import { verifyJWT, isAdminLogin } from '../middlewares/auth.js';
 
 const router = express.Router();
 
-// ============= ADMIN ROUTES =============
+/* ============================================================================ */
+/* 🔷 USER ROUTES - Individual Income Transactions                             */
+/* ============================================================================ */
 
-// ⚠️ DEPRECATED: Use automatic calculation via booking approval instead
-// Calculate matching income for current cycle (Admin/Cron) - Protected against duplicates
-// POST /api/matching-income/calculate
-router.post("/calculate", verifyJWT, isAdminLogin, calculateMatchingIncomeForCycle);
-
-// ✅ NEW: Recalculate matching income (Delete existing + Recalculate)
-// POST /api/matching-income/recalculate
-router.post("/recalculate", verifyJWT, isAdminLogin, recalculateMatchingIncome);
-
-// ✅ NEW: Delete matching income records for a cycle (cleanup)
-// DELETE /api/matching-income/cycle?cycleStartDate=2025-11-01&cycleEndDate=2025-11-30
-router.delete("/cycle", verifyJWT, isAdminLogin, deleteMatchingIncomeForCycle);
-
-// Get all matching income records for a cycle (Admin Dashboard)
-// GET /api/matching-income/cycle?cycleStartDate=2025-01-01&cycleEndDate=2025-01-31&status=calculated&page=1&limit=50
-router.get("/cycle", verifyJWT, isAdminLogin, getMatchingIncomeForCycle);
-
-// Approve a matching income record
-// PATCH /api/matching-income/approve/:recordId
-router.patch("/approve/:recordId", verifyJWT, isAdminLogin, approveMatchingIncome);
-
-// ============= USER ROUTES =============
-
-// Get individual matching income for a user (Personal Dashboard)
-// GET /api/matching-income/user/:userId?cycleStartDate=2025-01-01&status=calculated&page=1&limit=10
+/**
+ * Get individual matching income records for a user
+ * GET /api/matching-income/user/:userId
+ */
 router.get("/user/:userId", verifyJWT, getUserMatchingIncome);
 
-// Get team matching income (User's entire downline)
-// GET /api/matching-income/team/:userId?cycleStartDate=2025-01-01&status=calculated
+/**
+ * Get income details for a specific plot
+ * GET /api/matching-income/plot/:plotId
+ */
+router.get("/plot/:plotId", verifyJWT, getPlotIncomeDetails);
+
+/**
+ * Get income summary grouped by time period
+ * GET /api/matching-income/summary/:userId
+ */
+router.get("/summary/:userId", verifyJWT, getIncomeSummary);
+
+/**
+ * Get team income records (all downline members)
+ * GET /api/matching-income/team/:userId
+ */
 router.get("/team/:userId", verifyJWT, getTeamMatchingIncome);
+
+/* ============================================================================ */
+/* 🔶 ADMIN ROUTES - Income Management & Approval                              */
+/* ============================================================================ */
+
+/**
+ * Get all income records with advanced filtering (Admin Only)
+ * GET /api/matching-income/admin/all
+ */
+router.get("/admin/all", verifyJWT, isAdminLogin, getAllIncomeRecords);
+
+/**
+ * Get dashboard statistics (Admin Only)
+ * GET /api/matching-income/admin/stats
+ */
+router.get("/admin/stats", verifyJWT, isAdminLogin, getDashboardStats);
+
+/**
+ * Approve a single income record (Admin Only)
+ * PATCH /api/matching-income/admin/approve/:recordId
+ */
+router.patch("/admin/approve/:recordId", verifyJWT, isAdminLogin, approveMatchingIncome);
+
+/**
+ * Bulk approve multiple income records (Admin Only)
+ * POST /api/matching-income/admin/bulk-approve
+ */
+router.post("/admin/bulk-approve", verifyJWT, isAdminLogin, bulkApproveIncome);
+
+/**
+ * Reject an income record (Admin Only)
+ * PATCH /api/matching-income/admin/reject/:recordId
+ */
+router.patch("/admin/reject/:recordId", verifyJWT, isAdminLogin, rejectMatchingIncome);
+
+/**
+ * Update income status to credited/paid (Admin Only)
+ * PATCH /api/matching-income/admin/status/:recordId
+ */
+router.patch("/admin/status/:recordId", verifyJWT, isAdminLogin, updateIncomeStatus);
 
 export default router;

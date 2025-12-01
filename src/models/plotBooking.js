@@ -1,8 +1,10 @@
-// models/plotBooking.js
+// models/plotBookingCarryForward.js - COMPLETE VERSION with Carry-Forward Balance Logic
 import mongoose from 'mongoose';
 import { MatchingIncomeRecord } from './matchingIncomeSchema.js';
+import { LegBalance } from './legBalanceSchema.js';
 
 const { Schema } = mongoose;
+
 
 const plotSchema = new Schema({
   /* -------------------------------------------------------------------------- */
@@ -233,192 +235,216 @@ plotSchema.pre('save', function (next) {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 💰 POST-SAVE: Matching Income Logic                                       */
+/* 💰 POST-SAVE: Income Creation with Carry-Forward Logic                    */
 /* -------------------------------------------------------------------------- */
 plotSchema.post('save', async function (doc, next) {
   try {
+    // Only trigger when booking is approved
     if (doc.bookingDetails?.status === 'approved' && doc.bookingDetails?.buyerId) {
-      console.log(`\n🎯 Booking approved for plot ${doc.plotNumber}, triggering matching income...`);
+      console.log(`\n🎯 Booking approved for plot ${doc.plotNumber}, creating income with carry-forward logic...`);
 
-      const buyer = await mongoose.model('User').findById(doc.bookingDetails.buyerId)
-        .select('_id username sponsorId position')
+      const User = mongoose.model('User');
+      const buyer = await User.findById(doc.bookingDetails.buyerId)
+        .select('_id username sponsorId position personalInfo')
         .lean();
 
-      if (!buyer) return console.log('⚠️ Buyer not found');
+      if (!buyer) {
+        console.log('⚠️ Buyer not found');
+        return next();
+      }
 
-      const bookingDate = new Date(doc.bookingDetails.bookingDate || doc.bookingDetails.approvedAt || new Date());
-      const cycleStartDate = new Date(bookingDate.getFullYear(), bookingDate.getMonth(), 1);
-      const cycleEndDate = new Date(bookingDate.getFullYear(), bookingDate.getMonth() + 1, 0);
-      cycleEndDate.setHours(23, 59, 59, 999);
+      const saleAmount = doc.pricing?.totalPrice || 0;
+      const saleDate = new Date(doc.bookingDetails.bookingDate || doc.bookingDetails.approvedAt || new Date());
 
-      // Personal sale income for buyer
-      await calculatePersonalSaleIncome(buyer._id, doc.pricing.totalPrice, cycleStartDate, cycleEndDate, doc._id, bookingDate);
+      // 1️⃣ Create PERSONAL SALE income record for the buyer
+      await createPersonalSaleIncomeRecord(
+        buyer._id,
+        doc._id,
+        doc.plotNumber,
+        saleAmount,
+        saleDate,
+        buyer.username || buyer.personalInfo?.firstName
+      );
 
-      // Matching income for upline
-      if (buyer.sponsorId) await calculateMatchingIncomeForUpline(buyer.sponsorId, cycleStartDate, cycleEndDate);
+      // 2️⃣ Process MATCHING BONUS with Carry-Forward for upline chain
+      if (buyer.sponsorId) {
+        await processCarryForwardMatching(
+          buyer.sponsorId,
+          buyer._id,
+          buyer.username || buyer.personalInfo?.firstName,
+          buyer.position,
+          doc._id,
+          doc.plotNumber,
+          saleAmount,
+          saleDate
+        );
+      }
+
+      console.log(`✅ Income records created with carry-forward tracking for plot ${doc.plotNumber}`);
     }
   } catch (err) {
-    console.error('❌ Error in auto-matching income:', err);
+    console.error('❌ Error creating income records:', err);
   }
   next();
 });
 
 /* -------------------------------------------------------------------------- */
-/* 🔧 HELPER FUNCTIONS                                                       */
+/* 🔧 HELPER FUNCTIONS - Carry-Forward Matching Logic                        */
 /* -------------------------------------------------------------------------- */
 
-// Personal sale: 5%
-async function calculatePersonalSaleIncome(userId, saleAmount, cycleStartDate, cycleEndDate, plotId, bookingDate) {
-  const personalIncome = (saleAmount * 5) / 100;
-// ✅ replace in calculatePersonalSaleIncome(...)
-const existing = await MatchingIncomeRecord.findOne({
-  userId,
-  incomeType: 'personal_sale',
-  cycleStartDate,          // exact
-  cycleEndDate             // exact
-});
+/**
+ * Create a personal sale income record (5% of sale)
+ */
+async function createPersonalSaleIncomeRecord(userId, plotId, plotNumber, saleAmount, saleDate, buyerName) {
+  try {
+    const incomeAmount = (saleAmount * 5) / 100;
+    const eligibleDate = new Date(saleDate);
+    eligibleDate.setMonth(eligibleDate.getMonth() + 3); // 3 months from sale date
 
-
-  if (existing) {
-    existing.personalSales.totalSales += saleAmount;
-    existing.personalSales.totalBookings++;
-    existing.personalSales.bookingDetails.push({ plotId, amount: saleAmount, bookingDate });
-    existing.incomeAmount += personalIncome;
-    await existing.save();
-  } else {
-    await MatchingIncomeRecord.create({
-      userId, incomeType: 'personal_sale',
-      cycleStartDate, cycleEndDate,
-      personalSales: { totalSales: saleAmount, totalBookings: 1, bookingDetails: [{ plotId, amount: saleAmount, bookingDate }] },
-      incomeAmount: personalIncome, commissionPercentage: 5.0, status: 'calculated'
+    // Check if record already exists (prevent duplicates)
+    const existing = await MatchingIncomeRecord.findOne({
+      userId,
+      plotId,
+      incomeType: 'personal_sale'
     });
+
+    if (existing) {
+      console.log(`⚠️ Personal sale income already exists for plot ${plotNumber}`);
+      return;
+    }
+
+    await MatchingIncomeRecord.create({
+      userId,
+      incomeType: 'personal_sale',
+      plotId,
+      plotNumber,
+      buyerId: userId,
+      buyerName,
+      saleAmount,
+      legType: 'personal',
+      commissionPercentage: 5,
+      incomeAmount,
+      saleDate,
+      eligibleForApprovalDate: eligibleDate,
+      status: 'pending',
+      notes: `Personal sale income from plot ${plotNumber}`
+    });
+
+    console.log(`✅ Personal sale record created: ₹${incomeAmount.toLocaleString('en-IN')} for ${buyerName}`);
+  } catch (err) {
+    console.error('❌ Error creating personal sale record:', err);
   }
 }
 
-// Recursive matching income
-// Recursive Matching Income with Carry Forward (5% balanced, up to full upline chain)
-// ✅ replace the whole body of calculateMatchingIncomeForUpline with this improved version
-async function calculateMatchingIncomeForUpline(sponsorId, cycleStartDate, cycleEndDate, depth = 1) {
+/**
+ * Process carry-forward matching for upline chain
+ * This is the core logic that handles balance tracking and matching
+ */
+async function processCarryForwardMatching(sponsorId, buyerId, buyerName, buyerPosition, plotId, plotNumber, saleAmount, saleDate, depth = 1) {
   try {
-    const User = mongoose.model('User');
-    const Plot = mongoose.model('Plot');
-    if (depth > 10) return;
+    if (depth > 10) return; // Limit depth
 
+    const User = mongoose.model('User');
     const sponsor = await User.findById(sponsorId)
-      .select('_id username sponsorId position')
+      .select('_id username sponsorId position personalInfo')
       .lean();
+
     if (!sponsor) return;
 
-    // All approved bookings within the cycle (inclusive)
-    const bookings = await Plot.find({
-      'bookingDetails.bookingDate': { $gte: cycleStartDate, $lte: cycleEndDate },
-      'bookingDetails.status': 'approved'
-    })
-      .populate('bookingDetails.buyerId', '_id sponsorId position username')
-      .select('bookingDetails pricing.totalPrice')
-      .lean();
+    // Get or create leg balance record for this sponsor
+    const legBalance = await LegBalance.getOrCreate(sponsorId);
 
-    // Build downlines
-    const leftMembers = await getAllDownlineMembers(sponsorId, 'left');
-    const rightMembers = await getAllDownlineMembers(sponsorId, 'right');
-    const leftIds = new Set(leftMembers.map(m => m._id.toString()));
-    const rightIds = new Set(rightMembers.map(m => m._id.toString()));
+    // Determine which leg this sale belongs to
+    const buyerLeg = buyerPosition || 'left';
 
-    // Tally sales + (optional) booking details
-    let leftSales = 0, rightSales = 0, leftCount = 0, rightCount = 0;
-    const leftBookingDetails = [];
-    const rightBookingDetails = [];
+    console.log(`\n📊 Processing for ${sponsor.username}:`);
+    console.log(`   Before: Left: ₹${legBalance.leftLeg.availableBalance.toLocaleString('en-IN')}, Right: ₹${legBalance.rightLeg.availableBalance.toLocaleString('en-IN')}`);
 
-    for (const plot of bookings) {
-      const buyer = plot.bookingDetails?.buyerId;
-      const buyerId = buyer?._id?.toString();
-      if (!buyerId) continue;
-
-      const amt = Number(plot.pricing?.totalPrice || 0);
-      const bDate = plot.bookingDetails?.bookingDate || plot.bookingDetails?.approvedAt;
-
-      if (leftIds.has(buyerId)) {
-        leftSales += amt;
-        leftCount += 1;
-        leftBookingDetails.push({
-          plotId: plot._id,
-          buyerId: buyer._id,
-          buyerName: buyer.username || '',
-          amount: amt,
-          bookingDate: bDate
-        });
-      } else if (rightIds.has(buyerId)) {
-        rightSales += amt;
-        rightCount += 1;
-        rightBookingDetails.push({
-          plotId: plot._id,
-          buyerId: buyer._id,
-          buyerName: buyer.username || '',
-          amount: amt,
-          bookingDate: bDate
-        });
-      }
-    }
-
-    const balanced = Math.min(leftSales, rightSales);
-    const carryForward = {
-      left: Math.max(leftSales - balanced, 0),
-      right: Math.max(rightSales - balanced, 0)
-    };
-    const income = (balanced * 5) / 100;
-
-    // ✅ exact-cycle filter; ✅ ALWAYS set left/right totals and cycle dates
-    await MatchingIncomeRecord.findOneAndUpdate(
-      {
-        userId: sponsorId,
-        incomeType: 'matching_bonus',
-        cycleStartDate,
-        cycleEndDate
-      },
-      {
-        $set: {
-          cycleStartDate,
-          cycleEndDate,
-          leftLeg: {
-            totalSales: leftSales,
-            totalBookings: leftCount,
-            // keep previous details if you prefer; here we overwrite each cycle calc
-            directMembers: [], // optionally compute per-direct-member sales if needed
-            bookingDetails: leftBookingDetails
-          },
-          rightLeg: {
-            totalSales: rightSales,
-            totalBookings: rightCount,
-            directMembers: [],
-            bookingDetails: rightBookingDetails
-          },
-          balancedAmount: balanced,
-          carryForward,
-          incomeAmount: income,
-          commissionPercentage: 5,
-          status: 'calculated',
-          weakerLeg:
-            leftSales < rightSales ? 'left' :
-            rightSales < leftSales ? 'right' : 'equal',
-          notes: `Balanced ₹${balanced.toLocaleString('en-IN')} | Left ₹${leftSales.toLocaleString('en-IN')} | Right ₹${rightSales.toLocaleString('en-IN')}`
-        }
-      },
-      { upsert: true, new: true }
+    // Add this new sale to the appropriate leg
+    await legBalance.addSale(
+      buyerLeg,
+      plotId,
+      buyerId,
+      buyerName,
+      saleAmount,
+      saleDate,
+      plotNumber
     );
 
-    console.log(`✅ Matching income for ${sponsor.username} (L: ₹${leftSales}, R: ₹${rightSales}, Balanced: ₹${balanced}, Income: ₹${income})`);
+    console.log(`   Added ₹${saleAmount.toLocaleString('en-IN')} to ${buyerLeg} leg`);
+    console.log(`   After: Left: ₹${legBalance.leftLeg.availableBalance.toLocaleString('en-IN')}, Right: ₹${legBalance.rightLeg.availableBalance.toLocaleString('en-IN')}`);
 
+    // Try to process matching
+    const matchingResult = legBalance.processMatching();
+
+    if (matchingResult.matched) {
+      const incomeAmount = (matchingResult.matchedAmount * 5) / 100;
+      
+      // Update statistics
+      legBalance.totalMatchingIncome += incomeAmount;
+      await legBalance.save();
+
+      const eligibleDate = new Date(saleDate);
+      eligibleDate.setMonth(eligibleDate.getMonth() + 3);
+
+      // Create matching income record with detailed pairing info
+      const leftSaleInfo = matchingResult.leftUsed[0] || {};
+      const rightSaleInfo = matchingResult.rightUsed[0] || {};
+
+      await MatchingIncomeRecord.create({
+        userId: sponsorId,
+        incomeType: 'matching_bonus',
+        triggeredByPlotId: plotId,
+        plotNumber,
+        triggeredByBuyerId: buyerId,
+        buyerName,
+        legType: buyerLeg,
+        saleAmount,
+        pairedWith: {
+          plotId: buyerLeg === 'left' ? rightSaleInfo.plotId : leftSaleInfo.plotId,
+          buyerId: buyerLeg === 'left' ? rightSaleInfo.buyerId : leftSaleInfo.buyerId,
+          buyerName: buyerLeg === 'left' ? rightSaleInfo.buyerName : leftSaleInfo.buyerName,
+          amount: buyerLeg === 'left' ? rightSaleInfo.amountUsed : leftSaleInfo.amountUsed,
+          legType: buyerLeg === 'left' ? 'right' : 'left',
+          saleDate: buyerLeg === 'left' ? rightSaleInfo.saleDate : leftSaleInfo.saleDate
+        },
+        balancedAmount: matchingResult.matchedAmount,
+        commissionPercentage: 5,
+        incomeAmount,
+        saleDate,
+        eligibleForApprovalDate: eligibleDate,
+        status: 'pending',
+        notes: `Matching bonus: ₹${matchingResult.matchedAmount.toLocaleString('en-IN')} balanced between legs. Remaining: Left ₹${matchingResult.remainingLeft.toLocaleString('en-IN')}, Right ₹${matchingResult.remainingRight.toLocaleString('en-IN')}`
+      });
+
+      console.log(`   ✅ MATCHED! Income: ₹${incomeAmount.toLocaleString('en-IN')} from ₹${matchingResult.matchedAmount.toLocaleString('en-IN')} balanced`);
+      console.log(`   📦 Carry-Forward: Left: ₹${matchingResult.remainingLeft.toLocaleString('en-IN')}, Right: ₹${matchingResult.remainingRight.toLocaleString('en-IN')}`);
+    } else {
+      console.log(`   ⏳ No matching possible yet. Waiting for opposite leg sale.`);
+    }
+
+    // Continue up the chain
     if (sponsor.sponsorId) {
-      await calculateMatchingIncomeForUpline(sponsor.sponsorId, cycleStartDate, cycleEndDate, depth + 1);
+      await processCarryForwardMatching(
+        sponsor.sponsorId,
+        buyerId,
+        buyerName,
+        buyerPosition,
+        plotId,
+        plotNumber,
+        saleAmount,
+        saleDate,
+        depth + 1
+      );
     }
   } catch (err) {
-    console.error('❌ Error in calculateMatchingIncomeForUpline:', err);
+    console.error('❌ Error in carry-forward matching:', err);
   }
 }
 
-
-
-// Downline traversal
+/**
+ * Get all downline members recursively
+ */
 async function getAllDownlineMembers(userId, position = null) {
   const User = mongoose.model('User');
   const members = [];
@@ -427,12 +453,15 @@ async function getAllDownlineMembers(userId, position = null) {
   const traverse = async (id, pos) => {
     if (visited.has(id.toString())) return;
     visited.add(id.toString());
+    
     const query = { sponsorId: id };
     if (pos) query.position = pos;
+    
     const children = await User.find(query).select('_id username position').lean();
+    
     for (const child of children) {
       members.push(child);
-      await traverse(child._id, null);
+      await traverse(child._id, null); // Get all descendants
     }
   };
 
