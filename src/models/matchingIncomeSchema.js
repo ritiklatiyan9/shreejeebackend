@@ -1,4 +1,4 @@
-// models/matchingIncomeSchema.js - Individual Transaction-Based Income Model
+// models/matchingIncomeSchema.js - IMMEDIATE ELIGIBILITY VERSION
 import mongoose from 'mongoose';
 const { Schema } = mongoose;
 
@@ -111,7 +111,7 @@ const matchingIncomeRecordSchema = new Schema({
     index: true
   },
 
-  // Date when this income becomes eligible for approval (saleDate + 3 months)
+  // ✅ IMMEDIATE ELIGIBILITY - This date is now same as saleDate (no 3-month wait)
   eligibleForApprovalDate: {
     type: Date,
     required: true,
@@ -124,7 +124,7 @@ const matchingIncomeRecordSchema = new Schema({
   status: {
     type: String,
     enum: ['pending', 'eligible', 'approved', 'credited', 'paid', 'rejected'],
-    default: 'pending',
+    default: 'eligible', // ✅ Default to 'eligible' for immediate availability
     index: true
   },
 
@@ -181,12 +181,12 @@ matchingIncomeRecordSchema.index({ triggeredByPlotId: 1 });
 /* 🧮 VIRTUALS & METHODS                                                      */
 /* -------------------------------------------------------------------------- */
 
-// Check if income is eligible for approval
+// ✅ Check if income is eligible for approval (always true for immediate system)
 matchingIncomeRecordSchema.virtual('isEligibleForApproval').get(function() {
-  return new Date() >= new Date(this.eligibleForApprovalDate);
+  return this.status === 'eligible' || new Date() >= new Date(this.eligibleForApprovalDate);
 });
 
-// Days remaining until eligible for approval
+// ✅ Days remaining until eligible for approval (always 0 for immediate system)
 matchingIncomeRecordSchema.virtual('daysUntilEligible').get(function() {
   const now = new Date();
   const eligibleDate = new Date(this.eligibleForApprovalDate);
@@ -195,25 +195,55 @@ matchingIncomeRecordSchema.virtual('daysUntilEligible').get(function() {
   return diffDays > 0 ? diffDays : 0;
 });
 
-// Auto-update status to 'eligible' when date passes
+// ✅ IMMEDIATE ELIGIBILITY - No status auto-update needed
+// Income is created with 'eligible' status from the start
 matchingIncomeRecordSchema.pre('save', function(next) {
-  if (this.status === 'pending' && new Date() >= new Date(this.eligibleForApprovalDate)) {
+  // If eligibleForApprovalDate is not set, set it to saleDate (immediate)
+  if (!this.eligibleForApprovalDate && this.saleDate) {
+    this.eligibleForApprovalDate = this.saleDate;
+  }
+  
+  // Ensure status is eligible if not already set
+  if (this.isNew && !this.status) {
     this.status = 'eligible';
   }
+  
   next();
 });
 
-// Static method to update all pending records to eligible
+// ✅ Static method to update all pending records to eligible (for migration purposes)
 matchingIncomeRecordSchema.statics.updateEligibleRecords = async function() {
-  const now = new Date();
   const result = await this.updateMany(
     {
-      status: 'pending',
-      eligibleForApprovalDate: { $lte: now }
+      status: 'pending'
     },
     {
       $set: { status: 'eligible' }
     }
+  );
+  return result;
+};
+
+// ✅ Static method to migrate old records to immediate eligibility
+matchingIncomeRecordSchema.statics.migrateToImmediateEligibility = async function() {
+  const result = await this.updateMany(
+    {
+      eligibleForApprovalDate: { $gt: '$saleDate' }
+    },
+    [
+      {
+        $set: {
+          eligibleForApprovalDate: '$saleDate',
+          status: {
+            $cond: {
+              if: { $eq: ['$status', 'pending'] },
+              then: 'eligible',
+              else: '$status'
+            }
+          }
+        }
+      }
+    ]
   );
   return result;
 };

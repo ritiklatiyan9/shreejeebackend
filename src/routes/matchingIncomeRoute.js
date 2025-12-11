@@ -10,7 +10,8 @@ import {
   bulkApproveIncome,
   rejectMatchingIncome,
   updateIncomeStatus,
-  getDashboardStats
+  getDashboardStats,
+  getUserRewards
 } from '../controllers/matchingIncomeController.js';
 import { verifyJWT, isAdminLogin } from '../middlewares/auth.js';
 
@@ -43,6 +44,12 @@ router.get("/summary/:userId", verifyJWT, getIncomeSummary);
  * GET /api/matching-income/team/:userId
  */
 router.get("/team/:userId", verifyJWT, getTeamMatchingIncome);
+
+/**
+ * Get user rewards and current level
+ * GET /api/matching-income/rewards/:userId
+ */
+router.get("/rewards/:userId", verifyJWT, getUserRewards);
 
 /* ============================================================================ */
 /* 🔶 ADMIN ROUTES - Income Management & Approval                              */

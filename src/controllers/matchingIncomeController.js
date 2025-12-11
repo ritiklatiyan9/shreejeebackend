@@ -1,4 +1,4 @@
-// controllers/matchingIncomeController.js - Complete Implementation
+// controllers/matchingIncomeController.js - IMMEDIATE APPROVAL VERSION
 import { MatchingIncomeRecord } from '../models/matchingIncomeSchema.js';
 import { User } from '../models/userSchema.js';
 import { Plot } from '../models/plotBooking.js';
@@ -111,11 +111,10 @@ export const getUserMatchingIncome = async (req, res) => {
       summary.incomeByStatus[item._id] = item.total;
     });
 
-    // Eligible for approval
+    // Eligible for approval (all eligible status records)
     const eligibleRecords = await MatchingIncomeRecord.find({
       ...query,
-      status: { $in: ['pending', 'eligible'] },
-      eligibleForApprovalDate: { $lte: new Date() }
+      status: 'eligible'
     });
 
     summary.eligibleForApproval = {
@@ -480,8 +479,7 @@ export const getAllIncomeRecords = async (req, res) => {
 
     // Eligible only filter
     if (eligibleOnly === 'true') {
-      query.status = { $in: ['pending', 'eligible'] };
-      query.eligibleForApprovalDate = { $lte: new Date() };
+      query.status = 'eligible';
     }
 
     // Search filter
@@ -598,8 +596,7 @@ export const getDashboardStats = async (req, res) => {
 
     // Eligible for approval
     const eligibleRecords = await MatchingIncomeRecord.find({
-      status: { $in: ['pending', 'eligible'] },
-      eligibleForApprovalDate: { $lte: now }
+      status: 'eligible'
     });
 
     const eligibleForApproval = {
@@ -690,7 +687,7 @@ export const getDashboardStats = async (req, res) => {
 };
 
 /**
- * Approve a single income record (Admin Only)
+ * Approve a single income record (Admin Only) - IMMEDIATE APPROVAL
  * PATCH /api/matching-income/admin/approve/:recordId
  */
 export const approveMatchingIncome = async (req, res) => {
@@ -723,17 +720,15 @@ export const approveMatchingIncome = async (req, res) => {
       });
     }
 
-    // Check 3-month lock
-    const now = new Date();
-    const eligibleDate = new Date(record.eligibleForApprovalDate);
-
-    if (now < eligibleDate) {
-      const daysRemaining = Math.ceil((eligibleDate - now) / (1000 * 60 * 60 * 24));
+    // ✅ NO 3-MONTH LOCK CHECK - Approve immediately if status is eligible
+    if (record.status !== 'eligible') {
       return res.status(400).json({
         success: false,
-        message: `Cannot approve yet. Income becomes eligible in ${daysRemaining} days (on ${eligibleDate.toLocaleDateString()})`
+        message: 'Only eligible income can be approved'
       });
     }
+
+    const now = new Date();
 
     // Update record
     record.status = 'approved';
@@ -765,7 +760,7 @@ export const approveMatchingIncome = async (req, res) => {
 };
 
 /**
- * Bulk approve multiple income records (Admin Only)
+ * Bulk approve multiple income records (Admin Only) - IMMEDIATE APPROVAL
  * POST /api/matching-income/admin/bulk-approve
  */
 export const bulkApproveIncome = async (req, res) => {
@@ -813,14 +808,13 @@ export const bulkApproveIncome = async (req, res) => {
           continue;
         }
 
-        // Check 3-month lock
-        const eligibleDate = new Date(record.eligibleForApprovalDate);
-        if (now < eligibleDate) {
+        // ✅ NO 3-MONTH LOCK CHECK - Approve if eligible
+        if (record.status !== 'eligible') {
           results.skipped++;
           results.details.push({
             recordId,
             status: 'skipped',
-            message: 'Not eligible yet (3-month lock)'
+            message: 'Not eligible for approval'
           });
           continue;
         }
@@ -1025,6 +1019,108 @@ async function getAllDownlineMembers(userId, visited = new Set()) {
   return members;
 }
 
+/**
+ * Get user rewards and current level
+ * GET /api/matching-income/rewards/:userId
+ */
+export const getUserRewards = async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    // Get user's total income
+    const incomeSummary = await MatchingIncomeRecord.aggregate([
+      { $match: { userId: new mongoose.Types.ObjectId(userId), status: 'approved' } },
+      {
+        $group: {
+          _id: null,
+          totalIncome: { $sum: '$incomeAmount' },
+          lastSaleDate: { $max: '$saleDate' }
+        }
+      }
+    ]);
+
+    const totalIncome = incomeSummary[0]?.totalIncome || 0;
+    const lastSaleDate = incomeSummary[0]?.lastSaleDate || null;
+
+    // Define reward levels
+    const rewardLevels = [
+      { role: 'Sales Executive', achieve: 700000, rewards: ['₹15,000', '5G Mobile'], icon: '👨‍💼', imageUrl: 'https://akm-img-a-in.tosshub.com/indiatoday/images/story/202405/motorola-edge-50-pro-035026833-16x9.jpg?VersionId=i.ry9yloS2S8kSy39IME6FBQsqueNXyx' },
+      { role: 'Sales Manager', achieve: 2000000, rewards: ['₹50,000', 'Laptop i7', 'Foreign Trip 3N-4D'], icon: '👔', imageUrl: 'https://static.digit.in/default/63043a830597c650a77e5b892de23c519eb5100e.jpeg' },
+      { role: 'Territory Manager', achieve: 5000000, rewards: ['₹1,25,000', 'Bike'], icon: '🏍️', imageUrl: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcRYICm1kk49sIHI_tegQm0QeB6fvL7VJfnLAg&s' },
+      { role: 'Divisional Manager', achieve: 10000000, rewards: ['₹2,50,000', 'Bullet'], icon: '🏍️', imageUrl: 'https://imgd.aeplcdn.com/1280x720/n/cw/ec/156643/royalenfield-bullet-right-front-three-quarter3.jpeg?isig=0&wm=3' },
+      { role: 'Regional Manager', achieve: 30000000, rewards: ['₹7,50,000', 'Swift Car'], icon: '🚗', imageUrl: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTVvJgdjxkP0WFDAGBP3ko2P2pPQL3K9fGeVg&s' },
+      { role: 'Zonal Manager', achieve: 80000000, rewards: ['₹20,00,000', 'Tata Safari'], icon: '🚙', imageUrl: 'https://cdni.autocarindia.com/ExtraImages/20210204105942_2021_Tata_Safari_white_front.jpg' },
+      { role: 'Vice President', achieve: 100000000, rewards: ['₹2,50,00,000', 'Farm House'], icon: '🏡', imageUrl: 'https://t4.ftcdn.net/jpg/01/64/59/65/360_F_164596597_K4cn0KhFQ1R6USGg10xAN9IsHJNLQRkb.jpg' },
+      { role: 'General Manager', achieve: 50000000, rewards: ['₹1,25,00,000', 'Luxury Bungalow'], icon: '🏘️', imageUrl: 'https://media.inmobalia.com/imgV1/B95mbh8olwFQm~uCUaVOI2kQT0hb0a8sZ9turUNfnwtvuccYCzs0YVPfPbfkc2VnnN1JFDpiXNU9xzJ~Ag4BlYYPYZFIAjR7mCUc5JBLZPdgYJCxR1v5rEuUzU_c2l5t5RfA9A4ibbDcCe10wLVTA1gzagr2V3lBJiT7AZrQwB0hDkvTgaLD_paCEArhEnq8vZRo~5EsD4KnhBpeRR6wl14AfUVUY9d3J9Ih5kJFwzq7eRBg1Xs1c8fBJ3sutGCYoLfMyae~hKabvRxbS02z508fgWrSsd~RZvDcxlVTBWcMS~92Gj21s9Oizf2_G83WhPaqKRghQiWKpV3e6JPRkBrUnDS9vb91IqeGGkR5fc_~y5iYifxFGDsBRMuXKTp7HcnjfKB19Nuw50aPfi7uBdn_fyl5sd0qS17J1WQgSCpiyK_6K_Ozqg--.jpg' },
+      { role: 'Assistant General Manager', achieve: 25000000, rewards: ['₹62,50,000', 'Duplex 1200 sqft'], icon: '🏠', imageUrl: 'https://www.luxuryresidences.in/generic-assest/images/gurgaon/central-park-sky-villas.jpg' },
+      { role: 'President', achieve: 200000000, rewards: ['₹5,00,00,000', 'Cruise Yacht'], icon: '🛳️', imageUrl: 'https://images.unsplash.com/photo-1569263979104-865ab7cd8d13?fm=jpg&q=60&w=3000&ixlib=rb-4.1.0&ixid=M3wxMjA3fDB8MHxzZWFyY2h8M3x8eWFjaHR8ZW58MHx8MHx8fDA%3D' },
+      { role: 'Sales Director', achieve: 500000000, rewards: ['₹12,50,00,000', 'Helicopter'], icon: '🚁', imageUrl: 'https://encrypted-tbn0.gstatic.com/images?q=tbn:ANd9GcTnU0o6_1duTQyadQD_1JWZXI7vRqtjV_ATqQ&s' }
+    ];
+
+    // Determine current level
+    let currentLevel = null;
+    let currentLevelIndex = -1;
+
+    for (let i = rewardLevels.length - 1; i >= 0; i--) {
+      if (totalIncome >= rewardLevels[i].achieve) {
+        currentLevel = rewardLevels[i];
+        currentLevelIndex = i;
+        break;
+      }
+    }
+
+    // Check lock status for each level
+    const rewardsWithStatus = rewardLevels.map((level, index) => {
+      const isAchieved = totalIncome >= level.achieve;
+      let isLocked = true;
+      let lockReason = '';
+
+      if (isAchieved) {
+        if (lastSaleDate) {
+          const threeMonthsAfter = new Date(lastSaleDate);
+          threeMonthsAfter.setMonth(threeMonthsAfter.getMonth() + 3);
+          const now = new Date();
+
+          if (now >= threeMonthsAfter) {
+            isLocked = false;
+          } else {
+            lockReason = `Available after ${threeMonthsAfter.toLocaleDateString()}`;
+          }
+        } else {
+          isLocked = false; // No sales yet, but achieved? This shouldn't happen
+        }
+      } else {
+        lockReason = `Achieve ₹${level.achieve.toLocaleString('en-IN')} to unlock`;
+      }
+
+      return {
+        ...level,
+        isAchieved,
+        isLocked,
+        lockReason,
+        isCurrentLevel: index === currentLevelIndex
+      };
+    });
+
+    res.status(200).json({
+      success: true,
+      data: {
+        totalIncome,
+        lastSaleDate,
+        currentLevel,
+        rewards: rewardsWithStatus
+      }
+    });
+
+  } catch (error) {
+    console.error('Error in getUserRewards:', error);
+    res.status(500).json({
+      success: false,
+      message: error.message || 'Failed to fetch rewards'
+    });
+  }
+};
+
 export default {
   getUserMatchingIncome,
   getPlotIncomeDetails,
@@ -1035,5 +1131,6 @@ export default {
   approveMatchingIncome,
   bulkApproveIncome,
   rejectMatchingIncome,
-  updateIncomeStatus
+  updateIncomeStatus,
+  getUserRewards
 };

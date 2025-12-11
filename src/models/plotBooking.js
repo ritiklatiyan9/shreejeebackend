@@ -1,4 +1,4 @@
-// models/plotBookingCarryForward.js - COMPLETE VERSION with Carry-Forward Balance Logic
+// models/plotBookingCarryForward.js - IMMEDIATE INCOME VERSION (No 3-Month Lock)
 import mongoose from 'mongoose';
 import { MatchingIncomeRecord } from './matchingIncomeSchema.js';
 import { LegBalance } from './legBalanceSchema.js';
@@ -235,13 +235,13 @@ plotSchema.pre('save', function (next) {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 💰 POST-SAVE: Income Creation with Carry-Forward Logic                    */
+/* 💰 POST-SAVE: IMMEDIATE Income Creation (No 3-Month Lock)                 */
 /* -------------------------------------------------------------------------- */
 plotSchema.post('save', async function (doc, next) {
   try {
     // Only trigger when booking is approved
     if (doc.bookingDetails?.status === 'approved' && doc.bookingDetails?.buyerId) {
-      console.log(`\n🎯 Booking approved for plot ${doc.plotNumber}, creating income with carry-forward logic...`);
+      console.log(`\n🎯 Booking approved for plot ${doc.plotNumber}, creating IMMEDIATE income...`);
 
       const User = mongoose.model('User');
       const buyer = await User.findById(doc.bookingDetails.buyerId)
@@ -256,7 +256,7 @@ plotSchema.post('save', async function (doc, next) {
       const saleAmount = doc.pricing?.totalPrice || 0;
       const saleDate = new Date(doc.bookingDetails.bookingDate || doc.bookingDetails.approvedAt || new Date());
 
-      // 1️⃣ Create PERSONAL SALE income record for the buyer
+      // 1️⃣ Create PERSONAL SALE income record for the buyer (IMMEDIATELY ELIGIBLE)
       await createPersonalSaleIncomeRecord(
         buyer._id,
         doc._id,
@@ -266,7 +266,7 @@ plotSchema.post('save', async function (doc, next) {
         buyer.username || buyer.personalInfo?.firstName
       );
 
-      // 2️⃣ Process MATCHING BONUS with Carry-Forward for upline chain
+      // 2️⃣ Process MATCHING BONUS with Carry-Forward for upline chain (IMMEDIATELY ELIGIBLE)
       if (buyer.sponsorId) {
         await processCarryForwardMatching(
           buyer.sponsorId,
@@ -280,7 +280,7 @@ plotSchema.post('save', async function (doc, next) {
         );
       }
 
-      console.log(`✅ Income records created with carry-forward tracking for plot ${doc.plotNumber}`);
+      console.log(`✅ IMMEDIATE income records created for plot ${doc.plotNumber}`);
     }
   } catch (err) {
     console.error('❌ Error creating income records:', err);
@@ -289,17 +289,18 @@ plotSchema.post('save', async function (doc, next) {
 });
 
 /* -------------------------------------------------------------------------- */
-/* 🔧 HELPER FUNCTIONS - Carry-Forward Matching Logic                        */
+/* 🔧 HELPER FUNCTIONS - IMMEDIATE Income (No Lock)                          */
 /* -------------------------------------------------------------------------- */
 
 /**
- * Create a personal sale income record (5% of sale)
+ * Create a personal sale income record (5% of sale) - IMMEDIATELY ELIGIBLE
  */
 async function createPersonalSaleIncomeRecord(userId, plotId, plotNumber, saleAmount, saleDate, buyerName) {
   try {
     const incomeAmount = (saleAmount * 5) / 100;
-    const eligibleDate = new Date(saleDate);
-    eligibleDate.setMonth(eligibleDate.getMonth() + 3); // 3 months from sale date
+    
+    // ✅ IMMEDIATE ELIGIBILITY - No 3-month wait
+    const eligibleDate = new Date(saleDate); // Same as sale date
 
     // Check if record already exists (prevent duplicates)
     const existing = await MatchingIncomeRecord.findOne({
@@ -325,20 +326,19 @@ async function createPersonalSaleIncomeRecord(userId, plotId, plotNumber, saleAm
       commissionPercentage: 5,
       incomeAmount,
       saleDate,
-      eligibleForApprovalDate: eligibleDate,
-      status: 'pending',
-      notes: `Personal sale income from plot ${plotNumber}`
+      eligibleForApprovalDate: eligibleDate, // ✅ Immediate eligibility
+      status: 'eligible', // ✅ Set to 'eligible' immediately
+      notes: `Personal sale income from plot ${plotNumber} - Immediately eligible for approval`
     });
 
-    console.log(`✅ Personal sale record created: ₹${incomeAmount.toLocaleString('en-IN')} for ${buyerName}`);
+    console.log(`✅ Personal sale record created: ₹${incomeAmount.toLocaleString('en-IN')} for ${buyerName} (IMMEDIATELY ELIGIBLE)`);
   } catch (err) {
     console.error('❌ Error creating personal sale record:', err);
   }
 }
 
 /**
- * Process carry-forward matching for upline chain
- * This is the core logic that handles balance tracking and matching
+ * Process carry-forward matching for upline chain - IMMEDIATELY ELIGIBLE
  */
 async function processCarryForwardMatching(sponsorId, buyerId, buyerName, buyerPosition, plotId, plotNumber, saleAmount, saleDate, depth = 1) {
   try {
@@ -384,8 +384,8 @@ async function processCarryForwardMatching(sponsorId, buyerId, buyerName, buyerP
       legBalance.totalMatchingIncome += incomeAmount;
       await legBalance.save();
 
-      const eligibleDate = new Date(saleDate);
-      eligibleDate.setMonth(eligibleDate.getMonth() + 3);
+      // ✅ IMMEDIATE ELIGIBILITY - No 3-month wait
+      const eligibleDate = new Date(saleDate); // Same as sale date
 
       // Create matching income record with detailed pairing info
       const leftSaleInfo = matchingResult.leftUsed[0] || {};
@@ -412,12 +412,12 @@ async function processCarryForwardMatching(sponsorId, buyerId, buyerName, buyerP
         commissionPercentage: 5,
         incomeAmount,
         saleDate,
-        eligibleForApprovalDate: eligibleDate,
-        status: 'pending',
-        notes: `Matching bonus: ₹${matchingResult.matchedAmount.toLocaleString('en-IN')} balanced between legs. Remaining: Left ₹${matchingResult.remainingLeft.toLocaleString('en-IN')}, Right ₹${matchingResult.remainingRight.toLocaleString('en-IN')}`
+        eligibleForApprovalDate: eligibleDate, // ✅ Immediate eligibility
+        status: 'eligible', // ✅ Set to 'eligible' immediately
+        notes: `Matching bonus: ₹${matchingResult.matchedAmount.toLocaleString('en-IN')} balanced between legs - Immediately eligible. Remaining: Left ₹${matchingResult.remainingLeft.toLocaleString('en-IN')}, Right ₹${matchingResult.remainingRight.toLocaleString('en-IN')}`
       });
 
-      console.log(`   ✅ MATCHED! Income: ₹${incomeAmount.toLocaleString('en-IN')} from ₹${matchingResult.matchedAmount.toLocaleString('en-IN')} balanced`);
+      console.log(`   ✅ MATCHED! Income: ₹${incomeAmount.toLocaleString('en-IN')} from ₹${matchingResult.matchedAmount.toLocaleString('en-IN')} balanced (IMMEDIATELY ELIGIBLE)`);
       console.log(`   📦 Carry-Forward: Left: ₹${matchingResult.remainingLeft.toLocaleString('en-IN')}, Right: ₹${matchingResult.remainingRight.toLocaleString('en-IN')}`);
     } else {
       console.log(`   ⏳ No matching possible yet. Waiting for opposite leg sale.`);
