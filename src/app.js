@@ -9,6 +9,7 @@ import kycRoute from './routes/kycRoute.js';
 import plotRoute from './routes/plotRoute.js';
 import matchingIncomeRoute from './routes/matchingIncomeRoute.js';
 import legBalanceRoute from './routes/legBalanceRoute.js'; // ✅ NEW ROUTE
+import { startKeepAlive } from './utils/keepAlive.js'; // Keep-alive ping service
 
 import { corsOptions } from './origin/corsOptions.js';
 
@@ -37,5 +38,8 @@ app.use('/api/v1/admin', adminRoute);
 app.use('/api/v1/plots', plotRoute);
 app.use('/api/v1/matching-income', matchingIncomeRoute);
 app.use('/api/v1/leg-balance', legBalanceRoute); // ✅ NEW ROUTE
+
+// Start keep-alive ping service (pings external URL every 12 minutes)
+startKeepAlive();
 
 export { app };
