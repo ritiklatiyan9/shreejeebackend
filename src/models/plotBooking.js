@@ -61,7 +61,31 @@ const plotSchema = new Schema({
     registrationCharges: Number,
     developmentCharges: Number,
     totalPrice: { type: Number, required: true, min: [0, 'Price > 0'] },
-    currency: { type: String, default: 'INR' }
+    currency: { type: String, default: 'INR' },
+    // Admin visibility controls
+    showPriceToUser: { type: Boolean, default: true },
+    showBasePrice: { type: Boolean, default: true },
+    showTotalPrice: { type: Boolean, default: true },
+    showPricePerUnit: { type: Boolean, default: false },
+    showInstallmentPrices: { type: Boolean, default: true }
+  },
+
+  /* -------------------------------------------------------------------------- */
+  /* 💳 INSTALLMENT PLAN SETTINGS (Admin configurable)                         */
+  /* -------------------------------------------------------------------------- */
+  installmentPlan: {
+    enabled: { type: Boolean, default: true },
+    minDownPaymentPercent: { type: Number, default: 20, min: 0, max: 100 },
+    maxInstallments: { type: Number, default: 12, min: 1 },
+    installmentInterestRate: { type: Number, default: 0, min: 0 }, // Annual percentage
+    plans: [{
+      planName: { type: String },
+      numberOfInstallments: { type: Number },
+      downPaymentPercent: { type: Number },
+      interestRate: { type: Number, default: 0 },
+      emiAmount: { type: Number },
+      isActive: { type: Boolean, default: true }
+    }]
   },
 
   /* -------------------------------------------------------------------------- */
@@ -156,21 +180,44 @@ const plotSchema = new Schema({
     buyerId: { type: Schema.Types.ObjectId, ref: 'User' },
     bookingDate: Date,
     tokenAmount: { type: Number, min: [0, 'Token ≥ 0'] },
+    // Payment Type: 'full' (once) or 'installment'
+    paymentType: { 
+      type: String, 
+      enum: ['full', 'installment'], 
+      default: 'full' 
+    },
+    // Selected installment plan (if paymentType is 'installment')
+    selectedPlan: {
+      planName: String,
+      numberOfInstallments: Number,
+      downPaymentPercent: Number,
+      interestRate: { type: Number, default: 0 },
+      emiAmount: Number,
+      totalPayableAmount: Number // Total with interest
+    },
     paymentSchedule: [
       {
         installmentNumber: Number,
         amount: Number,
         dueDate: Date,
         paidDate: Date,
-        status: { type: String, enum: ['pending', 'paid', 'overdue'], default: 'pending' },
+        status: { type: String, enum: ['pending', 'paid', 'overdue', 'partial'], default: 'pending' },
+        paidAmount: { type: Number, default: 0 },
         receiptNo: String,
-        paymentMode: { type: String, enum: ['cash', 'cheque', 'rtgs', 'neft', 'upi', 'dd'], default: 'cash' },
+        paymentMode: { type: String, enum: ['cash', 'cheque', 'rtgs', 'neft', 'upi', 'dd', 'online'], default: 'cash' },
         transactionId: String,
         transactionDate: Date,
-        notes: String
+        notes: String,
+        // Income tracking
+        incomeProcessed: { type: Boolean, default: false },
+        incomeRecordId: { type: Schema.Types.ObjectId, ref: 'MatchingIncomeRecord' }
       }
     ],
     totalPaidAmount: { type: Number, default: 0, min: 0 },
+    remainingAmount: { type: Number, default: 0, min: 0 },
+    nextDueDate: Date,
+    lastPaymentDate: Date,
+    paymentProgress: { type: Number, default: 0, min: 0, max: 100 }, // Percentage paid
     status: { type: String, enum: ['pending', 'approved', 'rejected'], default: 'pending' },
     approvedBy: { type: Schema.Types.ObjectId, ref: 'User' },
     approvedAt: Date,

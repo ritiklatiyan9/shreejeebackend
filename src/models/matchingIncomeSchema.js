@@ -151,7 +151,11 @@ const matchingIncomeRecordSchema = new Schema({
     paymentMode: {
       type: String,
       enum: ['bank_transfer', 'wallet', 'cheque', 'cash', 'upi']
-    }
+    },
+    // Installment-specific tracking
+    installmentNumber: { type: Number },
+    paymentType: { type: String, enum: ['full', 'installment'] },
+    installmentAmount: { type: Number }
   },
 
   /* -------------------------------------------------------------------------- */

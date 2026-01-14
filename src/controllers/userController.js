@@ -46,139 +46,183 @@ const generateAccessAndRefreshTokens = async (userId) => {
   }
 };
 export const Register = asyncHandler(async (req, res) => {
-  const {
-    email,
-    password,
-    username,
-    confirmPassword,
-    role,
-    sponsorId,
-    firstName,
-    lastName,
-    phone,
-    dateOfBirth,
-    address,
-    accountNumber,
-    ifscCode,
-    accountHolderName
-  } = req.body;
-
-  // Validation for required fields
-  if (!username || !email || !password || !confirmPassword) {
-    return res.status(400).json(new ApiResponse(400, null, "All fields are required"));
-  }
-  if ([username, email, password, confirmPassword].some((field) => field?.trim() === "")) {
-    throw new ApiError(400, "All fields are required");
-  }
-  if (password !== confirmPassword) {
-    throw new ApiError(400, "Password and confirm password do not match");
-  }
-
-  const existedUser = await User.findOne({
-    $or: [{ username }, { email }],
-  });
-  if (existedUser) {
-    throw new ApiError(400, "User already exists");
-  }
-
-  // Validate sponsor and assign position logic
-  let actualSponsor = null;
-  let assignedPosition = null;
-  let originalSponsorId = null;
-  if (sponsorId) {
-    const originalSponsor = await User.findOne({ referralCode: sponsorId });
-    if (!originalSponsor) {
-      throw new ApiError(400, "Invalid sponsor referral code");
-    }
-    originalSponsorId = originalSponsor._id;
-    const findAvailablePosition = async (rootUserId) => {
-      const queue = [rootUserId];
-      while (queue.length > 0) {
-        const currentUserId = queue.shift();
-        const children = await User.find({ sponsorId: currentUserId })
-          .select('_id position')
-          .lean();
-        const leftChild = children.find(child => child.position === 'left');
-        const rightChild = children.find(child => child.position === 'right');
-
-        if (!leftChild) {
-          return {
-            sponsorId: currentUserId,
-            position: 'left'
-          };
-        }
-        if (!rightChild) {
-          return {
-            sponsorId: currentUserId,
-            position: 'right'
-          };
-        }
-        queue.push(leftChild._id);
-        queue.push(rightChild._id);
+  // Use the configured 'upload' middleware for the 'profileImage' field
+  // This will parse the multipart/form-data and place the file in req.file
+  upload.single('profileImage')(req, res, async (err) => {
+    if (err instanceof multer.MulterError) {
+      if (err.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json(new ApiResponse(400, null, "File too large. Maximum size is 5MB."));
       }
-      throw new ApiError(500, "Unable to find available position in binary tree");
-    };
-    const placement = await findAvailablePosition(originalSponsor._id);
-    actualSponsor = await User.findById(placement.sponsorId);
-    assignedPosition = placement.position;
-    console.log(`Placing new user under sponsor: ${actualSponsor.username} (${actualSponsor.memberId}) at position: ${assignedPosition}`);
-
-    if (actualSponsor._id.toString() !== originalSponsor._id.toString()) {
-      console.log(`Spillover occurred: Original sponsor was ${originalSponsor.username}, placed under ${actualSponsor.username}`);
+      // Add handling for other Multer errors if needed
+      console.error("Multer Error:", err);
+      return res.status(400).json(new ApiResponse(400, null, `File upload error: ${err.message}`));
+    } else if (err) {
+      console.error("Multer Error:", err);
+      return res.status(400).json(new ApiResponse(400, null, `File upload error: ${err.message}`));
     }
-  }
 
-  // Prepare personalInfo and bankDetails objects
-  const personalInfoObj = {
-    firstName: firstName?.trim() || '',
-    lastName: lastName?.trim() || '',
-    phone: phone?.trim() || '',
-    dateOfBirth: dateOfBirth ? new Date(dateOfBirth) : undefined,
-    address: address?.trim() || '',
-    profileImage: null // No file upload for JSON
-  };
+    const {
+      email,
+      password,
+      username,
+      confirmPassword,
+      role,
+      sponsorId,
+      'personalInfo[firstName]': firstName,
+      'personalInfo[lastName]': lastName,
+      'personalInfo[phone]': phone,
+      'personalInfo[dateOfBirth]': dateOfBirth,
+      'personalInfo[address]': address,
+      'bankDetails[accountNumber]': accountNumber,
+      'bankDetails[ifscCode]': ifscCode,
+      'bankDetails[accountHolderName]': accountHolderName
+    } = req.body;
 
-  const bankDetailsObj = {
-    accountNumber: accountNumber?.trim() || '',
-    ifscCode: ifscCode?.trim() || '',
-    accountHolderName: accountHolderName?.trim() || ''
-  };
+    // Validation for non-file fields (same as before)
+    if (!username || !email || !password || !confirmPassword) {
+      return res.status(400).json(new ApiResponse(400, null, "All fields are required"));
+    }
+    if ([username, email, password, confirmPassword].some((field) => field?.trim() === "")) {
+      throw new ApiError(400, "All fields are required");
+    }
+    if (password !== confirmPassword) {
+      throw new ApiError(400, "Password and confirm password do not match");
+    }
 
-  const user = await User.create({
-    email: email.trim(),
-    password,
-    username: username.toLowerCase().trim(),
-    confirmPassword: confirmPassword.trim(),
-    role: role || "user",
-    sponsorId: actualSponsor ? actualSponsor._id : null,
-    position: actualSponsor ? assignedPosition : null,
-    personalInfo: personalInfoObj,
-    bankDetails: bankDetailsObj
+    const existedUser = await User.findOne({
+      $or: [{ username }, { email }],
+    });
+    if (existedUser) {
+      throw new ApiError(400, "User already exists");
+    }
+
+    // Validate sponsor and assign position logic (same as before)
+    let actualSponsor = null;
+    let assignedPosition = null;
+    let originalSponsorId = null;
+    if (sponsorId) {
+      const originalSponsor = await User.findOne({ referralCode: sponsorId });
+      if (!originalSponsor) {
+        throw new ApiError(400, "Invalid sponsor referral code");
+      }
+      originalSponsorId = originalSponsor._id;
+      const findAvailablePosition = async (rootUserId) => {
+        const queue = [rootUserId];
+        while (queue.length > 0) {
+          const currentUserId = queue.shift();
+          const children = await User.find({ sponsorId: currentUserId })
+            .select('_id position')
+            .lean();
+          const leftChild = children.find(child => child.position === 'left');
+          const rightChild = children.find(child => child.position === 'right');
+
+          if (!leftChild) {
+            return {
+              sponsorId: currentUserId,
+              position: 'left'
+            };
+          }
+          if (!rightChild) {
+            return {
+              sponsorId: currentUserId,
+              position: 'right'
+            };
+          }
+          queue.push(leftChild._id);
+          queue.push(rightChild._id);
+        }
+        throw new ApiError(500, "Unable to find available position in binary tree");
+      };
+      const placement = await findAvailablePosition(originalSponsor._id);
+      actualSponsor = await User.findById(placement.sponsorId);
+      assignedPosition = placement.position;
+      console.log(`Placing new user under sponsor: ${actualSponsor.username} (${actualSponsor.memberId}) at position: ${assignedPosition}`);
+
+      if (actualSponsor._id.toString() !== originalSponsor._id.toString()) {
+        console.log(`Spillover occurred: Original sponsor was ${originalSponsor.username}, placed under ${actualSponsor.username}`);
+      }
+    }
+
+    // --- Handle Profile Image Upload to S3 using the NEW utility (uploadToS3) with buffer ---
+    let profileImageUrl = null;
+    if (req.file) { // Check if a file was actually uploaded via Multer
+      try {
+        // Validate file type again if necessary (though multer filter should handle this)
+        const allowedTypes = ['image/jpeg', 'image/jpg', 'image/png', 'image/webp'];
+        if (!allowedTypes.includes(req.file.mimetype)) {
+          throw new ApiError(400, "Invalid file type. Only image files (jpeg, jpg, png, webp) are allowed.");
+        }
+
+        // Upload the file BUFFER to S3 using the NEW S3 utility (AWS SDK v3)
+        // Ensure multer is using memoryStorage so req.file.buffer exists
+        const uploadResult = await uploadToS3(
+          req.file.buffer,        // Pass the BUFFER (file content) here (requires memoryStorage)
+          req.file.originalname,  // Use the original filename for S3 key
+          req.file.mimetype,      // Pass the mime type
+          'profile-images'        // Specify the S3 folder
+        );
+        profileImageUrl = uploadResult.url; // Get the public URL from the result
+        console.log("Image uploaded to S3:", profileImageUrl);
+      } catch (uploadError) {
+        console.error("S3 Upload Error (Controller):", uploadError);
+        // Consider deleting the user if registration fails due to image upload
+        // await User.findByIdAndDelete(user._id); // Rollback user creation if needed
+        throw new ApiError(500, `Failed to upload profile image to storage: ${uploadError.message}`); // Include error details
+      }
+    }
+
+    // Prepare personalInfo and bankDetails objects (same as before)
+    const personalInfoObj = {
+      firstName: firstName?.trim() || '',
+      lastName: lastName?.trim() || '',
+      phone: phone?.trim() || '',
+      dateOfBirth: dateOfBirth ? new Date(dateOfBirth) : undefined,
+      address: address?.trim() || '',
+      profileImage: profileImageUrl // Store the S3 URL
+    };
+
+    const bankDetailsObj = {
+      accountNumber: accountNumber?.trim() || '',
+      ifscCode: ifscCode?.trim() || '',
+      accountHolderName: accountHolderName?.trim() || ''
+    };
+
+    const user = await User.create({
+      email: email.trim(),
+      password,
+      username: username.toLowerCase().trim(),
+      confirmPassword: confirmPassword.trim(),
+      role: role || "user",
+      sponsorId: actualSponsor ? actualSponsor._id : null,
+      position: actualSponsor ? assignedPosition : null,
+      personalInfo: personalInfoObj,
+      bankDetails: bankDetailsObj
+    });
+
+    const createdUser = await User.findOne({ _id: user._id }).select(
+      "-password -refreshToken -confirmPassword"
+    );
+
+    if (!createdUser) {
+      throw new ApiError(400, "User registration failed");
+    }
+
+    const responseData = {
+      ...createdUser.toObject(),
+      placementInfo: actualSponsor ? {
+        directSponsor: {
+          memberId: actualSponsor.memberId,
+          username: actualSponsor.username
+        },
+        position: assignedPosition,
+        isSpillover: originalSponsorId && actualSponsor._id.toString() !== originalSponsorId.toString()
+      } : null
+    };
+
+    return res.status(201).json(
+      new ApiResponse(201, responseData, "User registered successfully")
+    );
   });
-
-  const createdUser = await User.findOne({ _id: user._id }).select(
-    "-password -refreshToken -confirmPassword"
-  );
-
-  if (!createdUser) {
-    throw new ApiError(400, "User registration failed");
-  }
-
-  const responseData = {
-    ...createdUser.toObject(),
-    placementInfo: actualSponsor ? {
-      directSponsor: {
-        memberId: actualSponsor.memberId,
-        username: actualSponsor.username
-      },
-      position: assignedPosition,
-      isSpillover: originalSponsorId && actualSponsor._id.toString() !== originalSponsorId.toString()
-    } : null
-  };
-
-  return res.status(201).json(
-    new ApiResponse(201, responseData, "User registered successfully")
-  );
 });
 export const loginUser = asyncHandler(async (req, res) => {
   const { email, username, password } = req.body;

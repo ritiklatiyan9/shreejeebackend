@@ -12,7 +12,11 @@ import {
   getPendingBookings,
   getAllBookings,
   getTeamBookingsStats,
-  
+  updatePlotVisibility,
+  updateInstallmentPlan,
+  bulkUpdateVisibility,
+  hardDeletePlot,
+  getPaymentStatistics
 } from "../controllers/adminPlotController.js";
 
 import {
@@ -23,7 +27,8 @@ import {
   getRightTeamBookings,
   getAllTeamBookings,
   cancelPlotBooking,
-  makePlotPayment
+  makePlotPayment,
+  getPaymentHistory
 } from "../controllers/userPlotBookingController.js";
 
 import { verifyJWT, isAdminLogin } from "../middlewares/auth.js";
@@ -52,16 +57,36 @@ router.route("/admin/plots/bookings/stats")
 router.route("/admin/plots/bookings")
   .get(verifyJWT, isAdminLogin, getAllBookings);
 
+// Payment statistics
+router.route("/admin/plots/payment-stats")
+  .get(verifyJWT, isAdminLogin, getPaymentStatistics);
+
+// Bulk visibility update
+router.route("/admin/plots/bulk-visibility")
+  .put(verifyJWT, isAdminLogin, bulkUpdateVisibility);
+
 router.route("/admin/plots/:plotId")
   .get(verifyJWT, isAdminLogin, getPlotById)
   .put(verifyJWT, isAdminLogin, updatePlot)
   .delete(verifyJWT, isAdminLogin, deletePlot);
+
+// Hard delete (permanent)
+router.route("/admin/plots/:plotId/hard-delete")
+  .delete(verifyJWT, isAdminLogin, hardDeletePlot);
 
 router.route("/admin/plots/:plotId/approve")
   .post(verifyJWT, isAdminLogin, approvePlotBooking);
 
 router.route("/admin/plots/:plotId/reject")
   .post(verifyJWT, isAdminLogin, rejectPlotBooking);
+
+// Visibility settings
+router.route("/admin/plots/:plotId/visibility")
+  .put(verifyJWT, isAdminLogin, updatePlotVisibility);
+
+// Installment plan settings
+router.route("/admin/plots/:plotId/installment-plan")
+  .put(verifyJWT, isAdminLogin, updateInstallmentPlan);
 
 /* -------------------------------------------------------------------------- */
 /* 👤 USER ROUTES                                                             */
@@ -93,7 +118,7 @@ router.route("/user/plots/:plotId/cancel")
 router.route("/user/plots/payment")
   .post(verifyJWT, makePlotPayment);
 
-  router.route("/admin/plots/:plotId/approve")
-  .post(verifyJWT, isAdminLogin, approvePlotBooking);
+router.route("/user/plots/:plotId/payment-history")
+  .get(verifyJWT, getPaymentHistory);
 
 export default router;

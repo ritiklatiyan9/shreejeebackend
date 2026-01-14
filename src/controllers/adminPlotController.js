@@ -503,3 +503,239 @@ export {
   getTeamBookingsStats,
   updatePaymentDetails,
 };
+
+/* -------------------------------------------------------------------------- */
+/* ⚙️ ADMIN: UPDATE PLOT VISIBILITY SETTINGS                                 */
+/* -------------------------------------------------------------------------- */
+const updatePlotVisibility = asyncHandler(async (req, res) => {
+  const { plotId } = req.params;
+  const { 
+    showPriceToUser, 
+    showBasePrice, 
+    showTotalPrice, 
+    showPricePerUnit,
+    showInstallmentPrices 
+  } = req.body;
+
+  const plot = await Plot.findById(plotId);
+  if (!plot) throw new ApiError(404, "Plot not found");
+
+  // Update visibility settings
+  if (typeof showPriceToUser === 'boolean') {
+    plot.pricing.showPriceToUser = showPriceToUser;
+  }
+  if (typeof showBasePrice === 'boolean') {
+    plot.pricing.showBasePrice = showBasePrice;
+  }
+  if (typeof showTotalPrice === 'boolean') {
+    plot.pricing.showTotalPrice = showTotalPrice;
+  }
+  if (typeof showPricePerUnit === 'boolean') {
+    plot.pricing.showPricePerUnit = showPricePerUnit;
+  }
+  if (typeof showInstallmentPrices === 'boolean') {
+    plot.pricing.showInstallmentPrices = showInstallmentPrices;
+  }
+
+  await plot.save();
+
+  return res.status(200).json({
+    success: true,
+    message: "Plot visibility settings updated successfully",
+    data: plot,
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* 💳 ADMIN: UPDATE INSTALLMENT PLAN SETTINGS                                */
+/* -------------------------------------------------------------------------- */
+const updateInstallmentPlan = asyncHandler(async (req, res) => {
+  const { plotId } = req.params;
+  const { 
+    enabled, 
+    minDownPaymentPercent, 
+    maxInstallments, 
+    installmentInterestRate,
+    plans 
+  } = req.body;
+
+  const plot = await Plot.findById(plotId);
+  if (!plot) throw new ApiError(404, "Plot not found");
+
+  // Initialize installmentPlan if not exists
+  if (!plot.installmentPlan) {
+    plot.installmentPlan = {};
+  }
+
+  if (typeof enabled === 'boolean') {
+    plot.installmentPlan.enabled = enabled;
+  }
+  if (typeof minDownPaymentPercent === 'number') {
+    plot.installmentPlan.minDownPaymentPercent = Math.min(100, Math.max(0, minDownPaymentPercent));
+  }
+  if (typeof maxInstallments === 'number') {
+    plot.installmentPlan.maxInstallments = Math.max(1, maxInstallments);
+  }
+  if (typeof installmentInterestRate === 'number') {
+    plot.installmentPlan.installmentInterestRate = Math.max(0, installmentInterestRate);
+  }
+  if (Array.isArray(plans)) {
+    plot.installmentPlan.plans = plans.map((plan, index) => ({
+      planName: plan.planName || `Plan ${index + 1}`,
+      numberOfInstallments: plan.numberOfInstallments || 6,
+      downPaymentPercent: plan.downPaymentPercent || 20,
+      interestRate: plan.interestRate || 0,
+      emiAmount: plan.emiAmount || 0,
+      isActive: plan.isActive !== false
+    }));
+  }
+
+  await plot.save();
+
+  return res.status(200).json({
+    success: true,
+    message: "Installment plan settings updated successfully",
+    data: plot,
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* 📦 ADMIN: BULK UPDATE VISIBILITY FOR MULTIPLE PLOTS                       */
+/* -------------------------------------------------------------------------- */
+const bulkUpdateVisibility = asyncHandler(async (req, res) => {
+  const { plotIds, visibilitySettings } = req.body;
+
+  if (!Array.isArray(plotIds) || plotIds.length === 0) {
+    throw new ApiError(400, "Plot IDs array is required");
+  }
+
+  const updateData = {};
+  if (typeof visibilitySettings?.showPriceToUser === 'boolean') {
+    updateData['pricing.showPriceToUser'] = visibilitySettings.showPriceToUser;
+  }
+  if (typeof visibilitySettings?.showBasePrice === 'boolean') {
+    updateData['pricing.showBasePrice'] = visibilitySettings.showBasePrice;
+  }
+  if (typeof visibilitySettings?.showTotalPrice === 'boolean') {
+    updateData['pricing.showTotalPrice'] = visibilitySettings.showTotalPrice;
+  }
+  if (typeof visibilitySettings?.showPricePerUnit === 'boolean') {
+    updateData['pricing.showPricePerUnit'] = visibilitySettings.showPricePerUnit;
+  }
+
+  const result = await Plot.updateMany(
+    { _id: { $in: plotIds } },
+    { $set: updateData }
+  );
+
+  return res.status(200).json({
+    success: true,
+    message: `Visibility updated for ${result.modifiedCount} plots`,
+    data: { modifiedCount: result.modifiedCount },
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* 🗑️ ADMIN: HARD DELETE PLOT (Permanent)                                    */
+/* -------------------------------------------------------------------------- */
+const hardDeletePlot = asyncHandler(async (req, res) => {
+  const { plotId } = req.params;
+
+  const plot = await Plot.findById(plotId);
+  if (!plot) throw new ApiError(404, "Plot not found");
+
+  // Check if plot has active booking
+  if (plot.status === 'booked' || plot.status === 'sold' || plot.status === 'pending') {
+    throw new ApiError(400, "Cannot delete a plot with active booking. Cancel the booking first.");
+  }
+
+  await Plot.findByIdAndDelete(plotId);
+
+  return res.status(200).json({
+    success: true,
+    message: "Plot permanently deleted",
+  });
+});
+
+/* -------------------------------------------------------------------------- */
+/* 📊 ADMIN: GET PAYMENT STATISTICS                                          */
+/* -------------------------------------------------------------------------- */
+const getPaymentStatistics = asyncHandler(async (req, res) => {
+  const { startDate, endDate, status } = req.query;
+
+  const matchQuery = {
+    'bookingDetails.buyerId': { $exists: true, $ne: null },
+    'bookingDetails.status': 'approved',
+    isActive: true
+  };
+
+  if (startDate && endDate) {
+    matchQuery['bookingDetails.approvedAt'] = {
+      $gte: new Date(startDate),
+      $lte: new Date(endDate)
+    };
+  }
+
+  const plots = await Plot.find(matchQuery)
+    .populate('bookingDetails.buyerId', 'username email personalInfo position')
+    .select('plotName plotNumber pricing bookingDetails');
+
+  let totalCollection = 0;
+  let totalRemaining = 0;
+  let fullPaymentCount = 0;
+  let installmentCount = 0;
+  let completedPayments = 0;
+  let pendingPayments = 0;
+
+  const paymentDetails = plots.map(plot => {
+    const bd = plot.bookingDetails;
+    totalCollection += bd.totalPaidAmount || 0;
+    totalRemaining += bd.remainingAmount || 0;
+
+    if (bd.paymentType === 'full') fullPaymentCount++;
+    else installmentCount++;
+
+    if (bd.paymentProgress >= 100) completedPayments++;
+    else pendingPayments++;
+
+    return {
+      plotId: plot._id,
+      plotNumber: plot.plotNumber,
+      plotName: plot.plotName,
+      buyer: bd.buyerId,
+      paymentType: bd.paymentType,
+      totalPrice: plot.pricing?.totalPrice,
+      totalPaid: bd.totalPaidAmount,
+      remaining: bd.remainingAmount,
+      progress: bd.paymentProgress,
+      nextDueDate: bd.nextDueDate,
+      installments: bd.paymentSchedule?.length || 0,
+      paidInstallments: bd.paymentSchedule?.filter(i => i.status === 'paid').length || 0
+    };
+  });
+
+  return res.status(200).json({
+    success: true,
+    message: "Payment statistics fetched successfully",
+    data: {
+      summary: {
+        totalPlots: plots.length,
+        totalCollection,
+        totalRemaining,
+        fullPaymentCount,
+        installmentCount,
+        completedPayments,
+        pendingPayments
+      },
+      paymentDetails
+    }
+  });
+});
+
+export {
+  updatePlotVisibility,
+  updateInstallmentPlan,
+  bulkUpdateVisibility,
+  hardDeletePlot,
+  getPaymentStatistics
+};
